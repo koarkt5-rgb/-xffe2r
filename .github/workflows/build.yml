@@ -1,0 +1,43 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show repo contents (debug)
+        run: find . -maxdepth 3 -iname "*.zip" -o -maxdepth 1 -type d
+
+      - name: Unzip project (finds the zip anywhere in repo)
+        run: |
+          ZIPFILE=$(find . -iname "*.zip" | head -n 1)
+          echo "Найден архив: $ZIPFILE"
+          if [ -z "$ZIPFILE" ]; then
+            echo "Zip-файл не найден в репозитории!"
+            exit 1
+          fi
+          unzip -o "$ZIPFILE" -d extracted
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Accept Android SDK licenses
+        run: yes | sdkmanager --licenses || true
+
+      - name: Find project folder and build
+        run: |
+          PROJECT_DIR=$(find extracted -maxdepth 2 -name "settings.gradle" -exec dirname {} \;)
+          echo "Папка проекта: $PROJECT_DIR"
+          cd "$PROJECT_DIR"
+          gradle assembleDebug
+
+      - name: Find built APK
+        run: find extracted -name "*.apk"
+
+      - uses: actions/upload-artifact@v4
