@@ -29,7 +29,6 @@ jobs:
 
       - name: Build Everything Automatically
         run: |
-          # 1. Распаковка архива
           mkdir -p build_dir
           if ls *.zip 1> /dev/null 2>&1; then unzip -o *.zip -d build_dir
           elif ls *.7z 1> /dev/null 2>&1; then sudo apt-get update && sudo apt-get install -y p7zip-full; 7z x *.7z -obuild_dir
@@ -39,7 +38,6 @@ jobs:
           PROJECT_DIR=$(realpath $(dirname "$SETTINGS_FILE"))
           cd "$PROJECT_DIR"
           
-          # 2. settings.gradle
           cat << 'EOF' > settings.gradle
           pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
           dependencyResolutionManagement {
@@ -50,7 +48,6 @@ jobs:
           include ':app'
           EOF
           
-          # 3. app/build.gradle
           cat << 'EOF' > app/build.gradle
           plugins { id 'com.android.application' }
           android {
@@ -71,12 +68,10 @@ jobs:
           dependencies { implementation 'com.github.topjohnwu.libsu:core:5.2.2' }
           EOF
           
-          # 4. Клонируем ImGui и библиотеку хуков
           cd app/src/main/cpp
           git clone --depth 1 https://github.com/ocornut/imgui.git
           git clone --depth 1 https://github.com/Rprop/And64InlineHook.git
           
-          # 5. Создаем CMakeLists.txt
           cat << 'EOF' > CMakeLists.txt
           cmake_minimum_required(VERSION 3.22.1)
           project("oxide")
@@ -99,7 +94,6 @@ jobs:
           target_link_libraries(modmenu ${log-lib} ${android-lib} ${EGL-lib} ${GLESv3-lib} dl)
           EOF
           
-          # 6. Код Инжектора (injector_bin.cpp)
           cat << 'EOF' > injector_bin.cpp
           #include <stdio.h>
           #include <stdlib.h>
@@ -115,9 +109,6 @@ jobs:
           #include <android/log.h>
           #include <errno.h>
 
-          #define LOG_TAG "InjectorBin"
-          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
-
           uint64_t get_module_base(pid_t pid, const char* module_name) {
               char filename[64]; snprintf(filename, sizeof(filename), "/proc/%d/maps", pid);
               FILE* fp = fopen(filename, "r"); if (!fp) return 0;
@@ -131,19 +122,15 @@ jobs:
           }
 
           int main(int argc, char** argv) {
-              if (argc < 3) { return 1; }
+              if (argc < 3) return 7;
               pid_t pid = atoi(argv[1]);
               const char* path = argv[2];
-              LOGI("Injecting into PID: %d", pid);
 
-              if (ptrace(PTRACE_ATTACH, pid, 0, 0) == -1) { 
-                  LOGI("PTRACE_ATTACH error: %d", errno); 
-                  return errno; 
-              } 
+              if (ptrace(PTRACE_ATTACH, pid, 0, 0) == -1) return 1; 
               int status; waitpid(pid, &status, 0);
               
               uint64_t target_libc_base = get_module_base(pid, "libc.so");
-              if (!target_libc_base) { LOGI("libc not found"); ptrace(PTRACE_DETACH, pid, 0, 0); return 3; }
+              if (!target_libc_base) { ptrace(PTRACE_DETACH, pid, 0, 0); return 2; }
 
               void* local_libc = dlopen("libc.so", RTLD_LAZY);
               uint64_t local_libc_base = get_module_base(getpid(), "libc.so");
@@ -152,7 +139,7 @@ jobs:
 
               struct user_pt_regs regs;
               struct iovec io = { .iov_base = &regs, .iov_len = sizeof(regs) };
-              if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &io) == -1) { ptrace(PTRACE_DETACH, pid, 0, 0); return 4; }
+              if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &io) == -1) { ptrace(PTRACE_DETACH, pid, 0, 0); return 3; }
               struct user_pt_regs saved_regs = regs;
 
               uint64_t mmap_args[] = {0, 256, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, (uint64_t)-1, 0};
@@ -163,7 +150,7 @@ jobs:
               waitpid(pid, &status, 0);
               ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &io);
               uint64_t remote_mem = regs.regs[0];
-              if (!remote_mem) { ptrace(PTRACE_DETACH, pid, 0, 0); return 5; }
+              if (!remote_mem) { ptrace(PTRACE_DETACH, pid, 0, 0); return 4; }
 
               struct iovec local_iov = { .iov_base = (void*)path, .iov_len = strlen(path) + 1 };
               struct iovec remote_iov = { .iov_base = (void*)remote_mem, .iov_len = strlen(path) + 1 };
@@ -181,12 +168,10 @@ jobs:
               ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &io);
               ptrace(PTRACE_DETACH, pid, 0, 0);
               
-              LOGI("Injection result: %d", handle != 0);
-              return handle != 0 ? 0 : 6;
+              return handle != 0 ? 0 : 5;
           }
           EOF
 
-          # 7. Код Меню (modmenu.cpp) - С ОТЛАДКОЙ
           cat << 'EOF' > modmenu.cpp
           #include <jni.h>
           #include <android/log.h>
@@ -203,17 +188,13 @@ jobs:
           #define LOG_TAG "OxideCheat"
           #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
-          bool aimbot = false;
-          bool esp = false;
           bool isInit = false;
           int frameCount = 0;
-
           EGLBoolean (*orig_eglSwapBuffers)(EGLDisplay dpy, EGLSurface surface) = nullptr;
 
           EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
               frameCount++;
               if (frameCount % 100 == 0) { LOGI("HOOK IS WORKING! Frame: %d", frameCount); }
-
               if (!isInit) {
                   isInit = true;
                   IMGUI_CHECKVERSION();
@@ -223,48 +204,33 @@ jobs:
                   ImGui::StyleColorsDark();
                   ImGui_ImplOpenGL3_Init("#version 300 es");
                   ImGui_ImplAndroid_Init(nullptr);
-                  LOGI("ImGui Initialized inside Hook!");
+                  LOGI("ImGui Initialized!");
               }
-
               ImGui_ImplOpenGL3_NewFrame();
               ImGui_ImplAndroid_NewFrame();
               ImGui::NewFrame();
-
               ImGui::Begin("ROCKET CHEAT");
-              ImGui::Text("Hook is working!");
-              ImGui::Checkbox("Aimbot", &aimbot);
-              ImGui::Checkbox("ESP", &esp);
+              ImGui::Text("Hook works!");
               ImGui::End();
-
               ImGui::Render();
               ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-
               return orig_eglSwapBuffers(dpy, surface);
           }
 
           void* menu_thread(void*) {
               sleep(5); 
-              LOGI("Trying to find eglSwapBuffers...");
-              
               void* handle = dlopen("libEGL.so", RTLD_LAZY);
-              if (!handle) { LOGI("Failed to dlopen libEGL.so!"); return nullptr; }
-              
+              if (!handle) return nullptr;
               void* target = dlsym(handle, "eglSwapBuffers");
-              if (!target) { LOGI("Failed to find eglSwapBuffers!"); return nullptr; }
-              
-              LOGI("Found eglSwapBuffers at %p. Hooking...", target);
+              if (!target) return nullptr;
               A64HookFunction(target, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
-              LOGI("Hook installation finished!");
               return nullptr;
           }
-
           __attribute__((constructor)) void init() {
-              LOGI("Library loaded in game!");
               pthread_t t; pthread_create(&t, nullptr, menu_thread, nullptr);
           }
           EOF
 
-          # 8. Создаем Java файл (Отключаем Yama и SELinux)
           cd "$PROJECT_DIR"
           mkdir -p app/src/main/java/com/example/oxidelauncher
           cat << 'EOF' > app/src/main/java/com/example/oxidelauncher/MainActivity.java
@@ -283,7 +249,6 @@ jobs:
           import com.topjohnwu.superuser.Shell;
 
           public class MainActivity extends Activity {
-
               private final String TARGET_PACKAGE = "com.catsbit.oxidesurvivalisland";
               private String customPluginPath = null;
               private TextView btnAddPlugin;
@@ -302,9 +267,7 @@ jobs:
                       startActivityForResult(i, 100);
                   });
 
-                  btnLaunch.setOnClickListener(v -> {
-                      new Thread(() -> doInject(TARGET_PACKAGE)).start();
-                  });
+                  btnLaunch.setOnClickListener(v -> new Thread(() -> doInject(TARGET_PACKAGE)).start());
               }
 
               @Override
@@ -320,14 +283,12 @@ jobs:
                           fos.close(); in.close();
                           customPluginPath = out.getAbsolutePath();
                           btnAddPlugin.setText("Плагин: загружен");
-                      } catch (Exception e) {
-                          Toast.makeText(this, "Ошибка: " + e.getMessage(), Toast.LENGTH_LONG).show();
-                      }
+                      } catch (Exception e) {}
                   }
               }
 
               private void doInject(String pkg) {
-                  runOnUiThread(() -> Toast.makeText(this, "Запускаем Oxide...", Toast.LENGTH_SHORT).show());
+                  runOnUiThread(() -> Toast.makeText(this, "Запуск...", Toast.LENGTH_SHORT).show());
                   Shell.cmd("monkey -p " + pkg + " 1").exec();
 
                   int pid = -1;
@@ -347,33 +308,25 @@ jobs:
                   }
 
                   File exeFile = new File(getApplicationInfo().nativeLibraryDir, "libinjector_bin.so");
-                  File modFile;
-                  if (customPluginPath != null) {
-                      modFile = new File(customPluginPath);
-                  } else {
-                      modFile = new File(getApplicationInfo().nativeLibraryDir, "libmodmenu.so");
-                  }
+                  File modFile = (customPluginPath != null) ? new File(customPluginPath) : new File(getApplicationInfo().nativeLibraryDir, "libmodmenu.so");
 
-                  // ОТКЛЮЧАЕМ YAMA И SELINUX
                   Shell.cmd("su -c 'setenforce 0'").exec();
                   Shell.cmd("su -c 'echo 0 > /proc/sys/kernel/yama/ptrace_scope'").exec();
-
                   Shell.cmd("su -c 'cp " + exeFile.getAbsolutePath() + " /data/local/tmp/injector_bin'").exec();
                   Shell.cmd("su -c 'chmod 755 /data/local/tmp/injector_bin'").exec();
                   Shell.cmd("su -c 'cp " + modFile.getAbsolutePath() + " /data/local/tmp/mod.so'").exec();
                   Shell.cmd("su -c 'chmod 755 /data/local/tmp/mod.so'").exec();
                   Shell.cmd("su -c 'chcon u:object_r:system_file:s0 /data/local/tmp/mod.so'").exec();
 
+                  // ПОЛУЧАЕМ РЕАЛЬНЫЙ КОД ОШИБКИ ОТ ИНЖЕКТОРА
                   Shell.Result result = Shell.cmd("su -c '/data/local/tmp/injector_bin " + pid + " /data/local/tmp/mod.so'").exec();
+                  int code = result.getCode();
                   
-                  boolean ok = (result.getCode() == 0);
-                  final int fPid = pid;
-                  runOnUiThread(() -> Toast.makeText(this, ok ? "УСПЕХ! Меню загружено (жди 5 сек)." : "Ошибка внедрения (см. логи)", Toast.LENGTH_LONG).show());
+                  runOnUiThread(() -> Toast.makeText(this, "Код: " + code, Toast.LENGTH_LONG).show());
               }
           }
           EOF
 
-          # 9. Запуск сборки
           cd "$PROJECT_DIR"
           if [ ! -f "gradlew" ]; then gradle wrapper; fi
           chmod +x gradlew
