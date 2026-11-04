@@ -23,6 +23,7 @@ jobs:
         with:
           packages: 'platform-tools'
 
+      # Используем NDK r25b, так как он лучше всего совместим с хуками
       - name: Install NDK and CMake
         run: |
           sdkmanager "ndk;25.2.9519653" "cmake;3.22.1"
@@ -70,16 +71,20 @@ jobs:
           dependencies { implementation 'com.github.topjohnwu.libsu:core:5.2.2' }
           EOF
           
-          # 3. Клонирование ImGui и Dobby
+          # 3. Клонирование ImGui и скачивание готовой libdobby.a
           cd app/src/main/cpp
           git clone --depth 1 https://github.com/ocornut/imgui.git
-          git clone --depth 1 https://github.com/jmpews/Dobby.git
           
-          # 4. ИСПРАВЛЕНИЕ ОШИБКИ DOBBY (@PAGE -> :pg_hi21:)
-          echo "Патчим Dobby для совместимости с NDK..."
-          find Dobby -type f \( -name "*.S" -o -name "*.asm" \) -exec sed -i 's/@PAGE/:pg_hi21:/g' {} +
+          # Скачиваем предварительно собранную статическую библиотеку Dobby для arm64
+          echo "Скачиваем готовую libdobby.a..."
+          mkdir -p Dobby/lib/arm64-v8a
+          curl -L -o Dobby/lib/arm64-v8a/libdobby.a https://github.com/3equals3/DobbyHook/raw/main/arm64-v8a/libdobby.a
           
-          # 5. CMakeLists.txt
+          # Скачиваем заголовочный файл dobby.h
+          mkdir -p Dobby/include
+          curl -L -o Dobby/include/dobby.h https://raw.githubusercontent.com/jmpews/Dobby/master/include/dobby.h
+          
+          # 4. CMakeLists.txt с подключением готовой библиотеки
           cat << 'EOF' > CMakeLists.txt
           cmake_minimum_required(VERSION 3.22.1)
           project("oxide")
@@ -89,32 +94,27 @@ jobs:
           target_link_libraries(injector_bin log dl)
           set_target_properties(injector_bin PROPERTIES OUTPUT_NAME "injector_bin.so")
 
-          # Dobby
-          if(NOT TARGET dobby)
-              set(DOBBY_DIR ${CMAKE_CURRENT_SOURCE_DIR}/Dobby)
-              macro(SET_OPTION option value)
-                  set(${option} ${value} CACHE INTERNAL "" FORCE)
-              endmacro()
-              SET_OPTION(DOBBY_DEBUG OFF)
-              SET_OPTION(DOBBY_GENERATE_SHARED OFF)
-              add_subdirectory(${DOBBY_DIR} dobby)
-              get_property(DOBBY_INCLUDE_DIRECTORIES TARGET dobby PROPERTY INCLUDE_DIRECTORIES)
-          endif()
-
           # Меню (ImGui + Vulkan)
           add_library(modmenu SHARED modmenu.cpp 
               imgui/imgui.cpp imgui/imgui_draw.cpp imgui/imgui_tables.cpp imgui/imgui_widgets.cpp
               imgui/backends/imgui_impl_vulkan.cpp imgui/backends/imgui_impl_android.cpp
           )
-          target_include_directories(modmenu PRIVATE imgui ${DOBBY_INCLUDE_DIRECTORIES})
-
+          
+          # Подключаем ImGui и Dobby
+          target_include_directories(modmenu PRIVATE imgui Dobby/include)
+          
+          # Линкуем со статической библиотекой Dobby
+          add_library(dobby STATIC IMPORTED)
+          set_target_properties(dobby PROPERTIES IMPORTED_LOCATION ${CMAKE_CURRENT_SOURCE_DIR}/Dobby/lib/arm64-v8a/libdobby.a)
+          
           find_library(log-lib log)
           find_library(android-lib android)
           find_library(vulkan-lib vulkan)
+          
           target_link_libraries(modmenu ${log-lib} ${android-lib} ${vulkan-lib} dl dobby)
           EOF
           
-          # 6. injector_bin.cpp (с memfd fallback)
+          # 5. injector_bin.cpp (memfd + ptrace fallback)
           cat << 'EOF' > injector_bin.cpp
           #include <stdio.h>
           #include <stdlib.h>
@@ -223,7 +223,7 @@ jobs:
           }
           EOF
 
-          # 7. modmenu.cpp (ImGui + Vulkan)
+          # 6. modmenu.cpp (ImGui + Vulkan)
           cat << 'EOF' > modmenu.cpp
           #include <jni.h>
           #include <android/log.h>
@@ -272,7 +272,7 @@ jobs:
           }
           EOF
 
-          # 8. MainActivity.java
+          # 7. MainActivity.java
           cd "$PROJECT_DIR"
           mkdir -p app/src/main/java/com/example/oxidelauncher
           cat << 'EOF' > app/src/main/java/com/example/oxidelauncher/MainActivity.java
@@ -334,7 +334,7 @@ jobs:
           }
           EOF
 
-          # 9. Сборка
+          # 8. Сборка
           cd "$PROJECT_DIR"
           if [ ! -f "gradlew" ]; then gradle wrapper; fi
           chmod +x gradlew
