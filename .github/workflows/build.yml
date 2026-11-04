@@ -29,7 +29,7 @@ jobs:
 
       - name: Build Everything Automatically
         run: |
-          # 1. Распаковка архива с дизайном лаунчера
+          # 1. Распаковка архива
           mkdir -p build_dir
           if ls *.zip 1> /dev/null 2>&1; then unzip -o *.zip -d build_dir
           elif ls *.7z 1> /dev/null 2>&1; then sudo apt-get update && sudo apt-get install -y p7zip-full; 7z x *.7z -obuild_dir
@@ -70,64 +70,26 @@ jobs:
           dependencies { implementation 'com.github.topjohnwu.libsu:core:5.2.2' }
           EOF
           
-          # 3. Клонируем шаблон и ИЩЕМ файлы
+          # 3. Клонируем ImGui и And64InlineHook
           cd app/src/main/cpp
-          echo "Клонируем Android-Imgui-Template..."
-          git clone --depth 1 https://github.com/traitimtrongvag/Android-Imgui-Template.git temp_template
+          git clone --depth 1 https://github.com/ocornut/imgui.git
+          git clone --depth 1 https://github.com/Rprop/And64InlineHook.git
           
-          # Ищем и копируем ImGui
-          echo "Поиск ImGui..."
-          IMGUI_DIR=$(find temp_template -type f -name "imgui.cpp" | head -n 1 | xargs dirname)
-          if [ -z "$IMGUI_DIR" ]; then echo "ImGui не найден!"; exit 1; fi
-          mkdir -p imgui
-          cp -r "$IMGUI_DIR"/* imgui/
-          
-          # Ищем и копируем Dobby
-          echo "Поиск Dobby..."
-          DOBBY_INCLUDE=$(find temp_template -type f -name "dobby.h" | head -n 1 | xargs dirname)
-          if [ -z "$DOBBY_INCLUDE" ]; then echo "Dobby не найден!"; exit 1; fi
-          mkdir -p dobby_include
-          cp -r "$DOBBY_INCLUDE"/* dobby_include/
-          
-          # Ищем и копируем исходники Dobby (если они есть)
-          DOBBY_SRC_DIR=$(find temp_template -type d -name "source" | head -n 1)
-          if [ -n "$DOBBY_SRC_DIR" ]; then
-              mkdir -p dobby_src
-              cp -r "$DOBBY_SRC_DIR"/* dobby_src/
-          else
-              echo "Исходники Dobby не найдены (возможно, используется готовая библиотека)."
-          fi
-          
-          # Удаляем временную папку
-          rm -rf temp_template
-          
-          # 4. Создаем CMakeLists.txt, используя найденные пути
+          # 4. CMakeLists.txt
           cat << 'EOF' > CMakeLists.txt
           cmake_minimum_required(VERSION 3.22.1)
           project("oxide")
 
-          # Наш инжектор (Executable)
           add_executable(injector_bin injector_bin.cpp)
           target_link_libraries(injector_bin log dl)
           set_target_properties(injector_bin PROPERTIES OUTPUT_NAME "injector_bin.so")
 
-          # Меню (ImGui + Dobby)
-          # Собираем все .cpp файлы из папки imgui
-          file(GLOB IMGUI_SOURCES "imgui/*.cpp")
-          
-          add_library(modmenu SHARED
-              Menu.cpp  # Мы создадим этот файл ниже
-              ${IMGUI_SOURCES}
+          add_library(modmenu SHARED modmenu.cpp 
+              imgui/imgui.cpp imgui/imgui_draw.cpp imgui/imgui_tables.cpp imgui/imgui_widgets.cpp
+              imgui/backends/imgui_impl_opengl3.cpp imgui/backends/imgui_impl_android.cpp
+              And64InlineHook/And64InlineHook.cpp
           )
-          
-          # Переименовываем выходной файл в libmodmenu.so
-          set_target_properties(modmenu PROPERTIES OUTPUT_NAME "modmenu")
-          
-          # Пути к заголовочным файлам
-          target_include_directories(modmenu PRIVATE
-              imgui
-              dobby_include
-          )
+          target_include_directories(modmenu PRIVATE imgui And64InlineHook)
 
           set(CMAKE_CXX_STANDARD 17)
           set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -136,37 +98,10 @@ jobs:
           find_library(android-lib android)
           find_library(EGL-lib EGL)
           find_library(GLESv3-lib GLESv3)
-
           target_link_libraries(modmenu ${log-lib} ${android-lib} ${EGL-lib} ${GLESv3-lib} dl)
           EOF
           
-          # 5. Создаем простой Menu.cpp (заглушка для меню)
-          cat << 'EOF' > Menu.cpp
-          #include <android/log.h>
-          #include <pthread.h>
-          #include <unistd.h>
-          #include "imgui.h"
-
-          #define LOG_TAG "OxideMenu"
-          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
-
-          bool isInit = false;
-
-          void* menu_thread(void*) {
-              sleep(3);
-              LOGI("Menu thread started (заглушка).");
-              // Здесь будет код инициализации ImGui и хуков
-              return nullptr;
-          }
-
-          __attribute__((constructor)) void init() {
-              LOGI("Menu library loaded!");
-              pthread_t t;
-              pthread_create(&t, nullptr, menu_thread, nullptr);
-          }
-          EOF
-          
-          # 6. injector_bin.cpp (без изменений)
+          # 5. injector_bin.cpp (без изменений)
           cat << 'EOF' > injector_bin.cpp
           #include <stdio.h>
           #include <stdlib.h>
@@ -245,7 +180,79 @@ jobs:
           }
           EOF
 
-          # 7. MainActivity.java (без изменений)
+          # 6. modmenu.cpp (НАСТОЯЩИЙ ImGui)
+          cat << 'EOF' > modmenu.cpp
+          #include <jni.h>
+          #include <android/log.h>
+          #include <pthread.h>
+          #include <unistd.h>
+          #include <EGL/egl.h>
+          #include <GLES3/gl3.h>
+          #include <dlfcn.h>
+          #include "imgui/imgui.h"
+          #include "imgui/backends/imgui_impl_opengl3.h"
+          #include "imgui/backends/imgui_impl_android.h"
+          #include "And64InlineHook.hpp"
+
+          #define LOG_TAG "OxideCheat"
+          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+
+          bool isInit = false;
+          EGLBoolean (*orig_eglSwapBuffers)(EGLDisplay dpy, EGLSurface surface) = nullptr;
+
+          EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
+              if (!isInit) {
+                  isInit = true;
+                  LOGI("Инициализация ImGui!");
+                  IMGUI_CHECKVERSION();
+                  ImGui::CreateContext();
+                  ImGuiIO& io = ImGui::GetIO();
+                  io.DisplaySize = ImVec2((float)1080, (float)2400);
+                  ImGui::StyleColorsDark();
+                  ImGui_ImplOpenGL3_Init("#version 300 es");
+                  ImGui_ImplAndroid_Init(nullptr);
+              }
+
+              // Рисуем кадр ImGui
+              ImGui_ImplOpenGL3_NewFrame();
+              ImGui_ImplAndroid_NewFrame();
+              ImGui::NewFrame();
+
+              ImGui::Begin("ROCKET CHEAT");
+              ImGui::Text("Injection successful!");
+              ImGui::Checkbox("Aimbot", &isInit); // Заглушка для галочки
+              ImGui::End();
+
+              ImGui::Render();
+              ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
+              // Вызываем оригинальную функцию игры
+              return orig_eglSwapBuffers(dpy, surface);
+          }
+
+          void* menu_thread(void*) {
+              sleep(5); // Ждем, пока игра прогрузится
+              LOGI("Ищем eglSwapBuffers...");
+              
+              void* handle = dlopen("libEGL.so", RTLD_LAZY);
+              if (!handle) { LOGI("libEGL.so не найдена!"); return nullptr; }
+              
+              void* target = dlsym(handle, "eglSwapBuffers");
+              if (!target) { LOGI("eglSwapBuffers не найдена!"); return nullptr; }
+              
+              LOGI("Ставим хук на eglSwapBuffers...");
+              A64HookFunction(target, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
+              LOGI("Хук установлен!");
+              return nullptr;
+          }
+
+          __attribute__((constructor)) void init() {
+              LOGI("Библиотека modmenu загружена в игру!");
+              pthread_t t; pthread_create(&t, nullptr, menu_thread, nullptr);
+          }
+          EOF
+
+          # 7. MainActivity.java
           cd "$PROJECT_DIR"
           mkdir -p app/src/main/java/com/example/oxidelauncher
           cat << 'EOF' > app/src/main/java/com/example/oxidelauncher/MainActivity.java
@@ -296,7 +303,6 @@ jobs:
                   File exeFile = new File(getApplicationInfo().nativeLibraryDir, "injector_bin.so");
                   File modFile = new File(getApplicationInfo().nativeLibraryDir, "libmodmenu.so");
 
-                  // Обход Samsung DEFEX (bind-mount logcat)
                   String cmd = "su -c '"
                       + "setenforce 0; "
                       + "echo 0 > /proc/sys/kernel/yama/ptrace_scope; "
