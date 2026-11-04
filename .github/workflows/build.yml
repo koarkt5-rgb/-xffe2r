@@ -70,16 +70,16 @@ jobs:
           dependencies { implementation 'com.github.topjohnwu.libsu:core:5.2.2' }
           EOF
           
-          # 3. Клонируем ImGuiAndroidVulkanHook и наш проект
+          # 3. Клонируем ImGuiAndroidVulkanHook и копируем нужные папки
           cd app/src/main/cpp
           echo "Клонируем ImGuiAndroidVulkanHook..."
           git clone --depth 1 https://github.com/Kaotic/ImGuiAndroidVulkanHook.git
           
-          # Копируем Menu и Dobby из репозитория
-          cp -r ImGuiAndroidVulkanHook/Menu/* .
+          # Копируем Menu и Dobby в наш проект
+          cp -r ImGuiAndroidVulkanHook/Menu .
           cp -r ImGuiAndroidVulkanHook/Dobby .
           
-          # 4. Создаем CMakeLists.txt (адаптированный под наш инжектор)
+          # 4. Создаем CMakeLists.txt (исправленный)
           cat << 'EOF' > CMakeLists.txt
           cmake_minimum_required(VERSION 3.22.1)
           project("oxide")
@@ -89,22 +89,31 @@ jobs:
           target_link_libraries(injector_bin log dl)
           set_target_properties(injector_bin PROPERTIES OUTPUT_NAME "injector_bin.so")
 
+          # Подключаем Dobby как предварительно собранную статическую библиотеку
+          add_library(dobby STATIC IMPORTED)
+          set_target_properties(dobby PROPERTIES IMPORTED_LOCATION ${CMAKE_SOURCE_DIR}/Dobby/${ANDROID_ABI}/libdobby.a)
+
           # Меню из ImGuiAndroidVulkanHook
-          add_library(modmenu SHARED main.cpp)
-          target_include_directories(modmenu PRIVATE Menu Dobby)
-          
-          # Подключаем Dobby как статическую библиотеку
-          add_subdirectory(Dobby dobby_build)
-          get_property(DOBBY_INCLUDE_DIRECTORIES TARGET dobby PROPERTY INCLUDE_DIRECTORIES)
-          target_include_directories(modmenu PRIVATE ${DOBBY_INCLUDE_DIRECTORIES})
+          add_library(modmenu SHARED
+              Menu/Menu.cpp
+              Menu/ImGui/imgui.cpp
+              Menu/ImGui/imgui_draw.cpp
+              Menu/ImGui/imgui_tables.cpp
+              Menu/ImGui/imgui_widgets.cpp
+              Menu/ImGui/backends/imgui_impl_android.cpp
+              Menu/ImGui/backends/imgui_impl_opengl3.cpp
+              Menu/ImGui/backends/imgui_impl_vulkan.cpp
+          )
+          target_include_directories(modmenu PRIVATE Menu/ImGui Menu/ImGui/backends Dobby)
 
           find_library(log-lib log)
           find_library(android-lib android)
           find_library(vulkan-lib vulkan)
-          target_link_libraries(modmenu ${log-lib} ${android-lib} ${vulkan-lib} dl dobby)
+
+          target_link_libraries(modmenu ${log-lib} ${android-lib} ${vulkan-lib} dl dobby z)
           EOF
           
-          # 5. injector_bin.cpp (без изменений, наш инжектор)
+          # 5. injector_bin.cpp (без изменений)
           cat << 'EOF' > injector_bin.cpp
           #include <stdio.h>
           #include <stdlib.h>
@@ -183,7 +192,7 @@ jobs:
           }
           EOF
 
-          # 6. MainActivity.java
+          # 6. MainActivity.java (без изменений)
           cd "$PROJECT_DIR"
           mkdir -p app/src/main/java/com/example/oxidelauncher
           cat << 'EOF' > app/src/main/java/com/example/oxidelauncher/MainActivity.java
