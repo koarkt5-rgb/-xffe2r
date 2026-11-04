@@ -1,86 +1,346 @@
-cat << 'EOF' > injector_bin.cpp
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <sys/ptrace.h>
-#include <sys/wait.h>
-#include <sys/mman.h>
-#include <sys/uio.h>
-#include <dlfcn.h>
-#include <linux/elf.h>
-#include <sys/user.h>
-#include <android/log.h>
-#include <errno.h>
+name: Build APK
 
-#define LOG_TAG "InjectorBin"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
 
-uint64_t get_module_base(pid_t pid, const char* module_name) {
-    char filename[64]; snprintf(filename, sizeof(filename), "/proc/%d/maps", pid);
-    FILE* fp = fopen(filename, "r"); if (!fp) { LOGI("Fail open maps: %d", errno); return 0; }
-    char line[512]; uint64_t base_addr = 0;
-    while (fgets(line, sizeof(line), fp)) {
-        if (strstr(line, module_name) && strstr(line, "r-xp")) {
-            sscanf(line, "%lx-%*lx %*s %*lx %*s %*s", &base_addr); break;
-        }
-    }
-    fclose(fp); return base_addr;
-}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-uint64_t remote_call(pid_t pid, uint64_t func_addr, uint64_t* args, int arg_count) {
-    struct user_pt_regs regs;
-    struct iovec io = { .iov_base = &regs, .iov_len = sizeof(regs) };
-    if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &io) == -1) { LOGI("GETREGSET fail: %d", errno); return 0; }
-    struct user_pt_regs saved_regs = regs;
-    for (int i = 0; i < arg_count && i < 8; i++) regs.regs[i] = args[i];
-    regs.pc = func_addr;
-    if (ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &io) == -1) { LOGI("SETREGSET fail: %d", errno); return 0; }
-    ptrace(PTRACE_CONT, pid, 0, 0);
-    int status; waitpid(pid, &status, 0);
-    ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &io);
-    uint64_t ret_val = regs.regs[0];
-    struct iovec io_saved = { .iov_base = &saved_regs, .iov_len = sizeof(saved_regs) };
-    ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &io_saved);
-    return ret_val;
-}
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
 
-int main(int argc, char** argv) {
-    if (argc < 3) { LOGI("No args"); return 1; }
-    pid_t pid = atoi(argv[1]);
-    const char* path = argv[2];
-    LOGI("Trying to attach to PID: %d", pid);
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
 
-    if (ptrace(PTRACE_ATTACH, pid, 0, 0) == -1) { 
-        LOGI("PTRACE_ATTACH failed: %d", errno); 
-        return 1; 
-    }
-    int status; waitpid(pid, &status, 0);
-    LOGI("Attached successfully!");
+      - name: Install NDK and CMake
+        run: |
+          sdkmanager "ndk;27.0.12077973" "cmake;3.22.1"
 
-    uint64_t target_libc_base = get_module_base(pid, "libc.so");
-    if (!target_libc_base) { LOGI("libc.so not found in maps"); ptrace(PTRACE_DETACH, pid, 0, 0); return 1; }
-    LOGI("libc.so base: 0x%lx", target_libc_base);
+      - name: Build Everything Automatically
+        run: |
+          # 1. Распаковка архива
+          mkdir -p build_dir
+          if ls *.zip 1> /dev/null 2>&1; then unzip -o *.zip -d build_dir
+          elif ls *.7z 1> /dev/null 2>&1; then sudo apt-get update && sudo apt-get install -y p7zip-full; 7z x *.7z -obuild_dir
+          else cp -r . build_dir/; fi
+          
+          # Находим папку проекта и делаем ПУТЬ АБСОЛЮТНЫМ
+          SETTINGS_FILE=$(find build_dir -name "settings.gradle" | head -n 1)
+          PROJECT_DIR=$(realpath $(dirname "$SETTINGS_FILE"))
+          echo "Папка проекта: $PROJECT_DIR"
+          cd "$PROJECT_DIR"
+          
+          # 2. Перезаписываем settings.gradle
+          cat << 'EOF' > settings.gradle
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral(); maven { url 'https://jitpack.io' } }
+          }
+          rootProject.name = "OxideLauncher"
+          include ':app'
+          EOF
+          
+          # 3. Перезаписываем app/build.gradle
+          cat << 'EOF' > app/build.gradle
+          plugins { id 'com.android.application' }
+          android {
+              namespace 'com.example.oxidelauncher'
+              compileSdk 34
+              ndkVersion "27.0.12077973"
+              defaultConfig {
+                  applicationId "com.example.oxidelauncher"
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+                  ndk { abiFilters 'arm64-v8a' }
+              }
+              externalNativeBuild { cmake { path "src/main/cpp/CMakeLists.txt"; version "3.22.1" } }
+              compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+          }
+          dependencies { implementation 'com.github.topjohnwu.libsu:core:5.2.2' }
+          EOF
+          
+          # 4. Клонируем ImGui
+          cd app/src/main/cpp
+          git clone --depth 1 https://github.com/ocornut/imgui.git
+          
+          # 5. Создаем CMakeLists.txt (Собираем бинарник и меню)
+          cat << 'EOF' > CMakeLists.txt
+          cmake_minimum_required(VERSION 3.22.1)
+          project("oxide")
+          
+          # Инжектор (Executable)
+          add_executable(injector_bin injector_bin.cpp)
+          target_link_libraries(injector_bin log dl)
+          set_target_properties(injector_bin PROPERTIES OUTPUT_NAME "injector_bin.so")
+          
+          # Меню (ImGui)
+          add_library(modmenu SHARED modmenu.cpp 
+              imgui/imgui.cpp imgui/imgui_draw.cpp imgui/imgui_tables.cpp imgui/imgui_widgets.cpp
+              imgui/backends/imgui_impl_opengl3.cpp imgui/backends/imgui_impl_android.cpp
+          )
+          target_include_directories(modmenu PRIVATE imgui)
+          
+          find_library(log-lib log)
+          find_library(android-lib android)
+          find_library(EGL-lib EGL)
+          find_library(GLESv3-lib GLESv3)
+          target_link_libraries(modmenu ${log-lib} ${android-lib} ${EGL-lib} ${GLESv3-lib} dl)
+          EOF
+          
+          # 6. Код Инжектора (injector_bin.cpp) - С ОТЛАДОЧНЫМИ ЛОГАМИ
+          cat << 'EOF' > injector_bin.cpp
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <unistd.h>
+          #include <sys/ptrace.h>
+          #include <sys/wait.h>
+          #include <sys/mman.h>
+          #include <sys/uio.h>
+          #include <dlfcn.h>
+          #include <linux/elf.h>
+          #include <sys/user.h>
+          #include <android/log.h>
+          #include <errno.h>
 
-    void* local_libc = dlopen("libc.so", RTLD_LAZY);
-    uint64_t target_mmap = target_libc_base + ((uint64_t)dlsym(local_libc, "mmap") - get_module_base(getpid(), "libc.so"));
-    uint64_t target_dlopen = target_libc_base + ((uint64_t)dlsym(local_libc, "dlopen") - get_module_base(getpid(), "libc.so"));
+          #define LOG_TAG "InjectorBin"
+          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
-    uint64_t mmap_args[] = {0, 256, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, (uint64_t)-1, 0};
-    uint64_t remote_mem = remote_call(pid, target_mmap, mmap_args, 6);
-    if (!remote_mem) { LOGI("mmap failed in remote"); ptrace(PTRACE_DETACH, pid, 0, 0); return 1; }
-    LOGI("mmap success: 0x%lx", remote_mem);
+          uint64_t get_module_base(pid_t pid, const char* module_name) {
+              char filename[64]; snprintf(filename, sizeof(filename), "/proc/%d/maps", pid);
+              FILE* fp = fopen(filename, "r"); if (!fp) { LOGI("Fail open maps: %d", errno); return 0; }
+              char line[512]; uint64_t base_addr = 0;
+              while (fgets(line, sizeof(line), fp)) {
+                  if (strstr(line, module_name) && strstr(line, "r-xp")) {
+                      sscanf(line, "%lx-%*lx %*s %*lx %*s %*s", &base_addr); break;
+                  }
+              }
+              fclose(fp); return base_addr;
+          }
 
-    struct iovec local_iov = { .iov_base = (void*)path, .iov_len = strlen(path) + 1 };
-    struct iovec remote_iov = { .iov_base = (void*)remote_mem, .iov_len = strlen(path) + 1 };
-    process_vm_writev(pid, &local_iov, 1, &remote_iov, 1, 0);
-    LOGI("Path written to remote memory");
+          uint64_t remote_call(pid_t pid, uint64_t func_addr, uint64_t* args, int arg_count) {
+              struct user_pt_regs regs;
+              struct iovec io = { .iov_base = &regs, .iov_len = sizeof(regs) };
+              if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &io) == -1) { LOGI("GETREGSET fail: %d", errno); return 0; }
+              struct user_pt_regs saved_regs = regs;
+              for (int i = 0; i < arg_count && i < 8; i++) regs.regs[i] = args[i];
+              regs.pc = func_addr;
+              if (ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &io) == -1) { LOGI("SETREGSET fail: %d", errno); return 0; }
+              ptrace(PTRACE_CONT, pid, 0, 0);
+              int status; waitpid(pid, &status, 0);
+              ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &io);
+              uint64_t ret_val = regs.regs[0];
+              struct iovec io_saved = { .iov_base = &saved_regs, .iov_len = sizeof(saved_regs) };
+              ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &io_saved);
+              return ret_val;
+          }
 
-    uint64_t dlopen_args[] = {remote_mem, RTLD_NOW};
-    uint64_t handle = remote_call(pid, target_dlopen, dlopen_args, 2);
-    LOGI("dlopen returned: 0x%lx", handle);
+          int main(int argc, char** argv) {
+              if (argc < 3) { LOGI("No args"); return 1; }
+              pid_t pid = atoi(argv[1]);
+              const char* path = argv[2];
+              LOGI("Trying to attach to PID: %d", pid);
 
-    ptrace(PTRACE_DETACH, pid, 0, 0);
-    return handle != 0 ? 0 : 1;
-}
-EOF
+              if (ptrace(PTRACE_ATTACH, pid, 0, 0) == -1) { 
+                  LOGI("PTRACE_ATTACH failed: %d", errno); 
+                  return 1; 
+              }
+              int status; waitpid(pid, &status, 0);
+              LOGI("Attached successfully!");
+
+              uint64_t target_libc_base = get_module_base(pid, "libc.so");
+              if (!target_libc_base) { LOGI("libc.so not found in maps"); ptrace(PTRACE_DETACH, pid, 0, 0); return 1; }
+              LOGI("libc.so base: 0x%lx", target_libc_base);
+
+              void* local_libc = dlopen("libc.so", RTLD_LAZY);
+              uint64_t target_mmap = target_libc_base + ((uint64_t)dlsym(local_libc, "mmap") - get_module_base(getpid(), "libc.so"));
+              uint64_t target_dlopen = target_libc_base + ((uint64_t)dlsym(local_libc, "dlopen") - get_module_base(getpid(), "libc.so"));
+
+              uint64_t mmap_args[] = {0, 256, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, (uint64_t)-1, 0};
+              uint64_t remote_mem = remote_call(pid, target_mmap, mmap_args, 6);
+              if (!remote_mem) { LOGI("mmap failed in remote"); ptrace(PTRACE_DETACH, pid, 0, 0); return 1; }
+              LOGI("mmap success: 0x%lx", remote_mem);
+
+              struct iovec local_iov = { .iov_base = (void*)path, .iov_len = strlen(path) + 1 };
+              struct iovec remote_iov = { .iov_base = (void*)remote_mem, .iov_len = strlen(path) + 1 };
+              process_vm_writev(pid, &local_iov, 1, &remote_iov, 1, 0);
+              LOGI("Path written to remote memory");
+
+              uint64_t dlopen_args[] = {remote_mem, RTLD_NOW};
+              uint64_t handle = remote_call(pid, target_dlopen, dlopen_args, 2);
+              LOGI("dlopen returned: 0x%lx", handle);
+
+              ptrace(PTRACE_DETACH, pid, 0, 0);
+              return handle != 0 ? 0 : 1;
+          }
+          EOF
+
+          # 7. Код Меню (modmenu.cpp)
+          cat << 'EOF' > modmenu.cpp
+          #include <jni.h>
+          #include <android/log.h>
+          #include <pthread.h>
+          #include <unistd.h>
+          #include "imgui/imgui.h"
+          
+          #define LOG_TAG "OxideCheat"
+          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+          
+          bool aimbot = false;
+          bool esp = false;
+          
+          void* menu_thread(void*) {
+              sleep(5);
+              LOGI("MENU LOADED! ImGui Ready.");
+              while(true) {
+                  if(aimbot) { /* Логика аима */ }
+                  if(esp) { /* Логика есп */ }
+                  sleep(1);
+              }
+              return nullptr;
+          }
+          
+          __attribute__((constructor))
+          void init() {
+              pthread_t t;
+              pthread_create(&t, nullptr, menu_thread, nullptr);
+          }
+          EOF
+
+          # 8. Создаем Java файл (с рабочей кнопкой выбора плагина)
+          cd "$PROJECT_DIR"
+          mkdir -p app/src/main/java/com/example/oxidelauncher
+          cat << 'EOF' > app/src/main/java/com/example/oxidelauncher/MainActivity.java
+          package com.example.oxidelauncher;
+
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.widget.TextView;
+          import android.widget.Toast;
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.InputStream;
+          import java.util.List;
+          import com.topjohnwu.superuser.Shell;
+
+          public class MainActivity extends Activity {
+
+              private final String TARGET_PACKAGE = "com.catsbit.oxidesurvivalisland";
+              private String customPluginPath = null;
+              private TextView btnAddPlugin;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  setContentView(R.layout.activity_main);
+
+                  TextView btnLaunch = findViewById(R.id.btnLaunch);
+                  btnAddPlugin = findViewById(R.id.btnAddPlugin); 
+
+                  Shell.getShell(shell -> {
+                      if (!shell.isRoot()) runOnUiThread(() -> Toast.makeText(this, "НЕТ ROOT!", Toast.LENGTH_LONG).show());
+                  });
+
+                  btnAddPlugin.setOnClickListener(v -> {
+                      Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                      i.setType("*/*");
+                      startActivityForResult(i, 100);
+                  });
+
+                  btnLaunch.setOnClickListener(v -> {
+                      new Thread(() -> doInject(TARGET_PACKAGE)).start();
+                  });
+              }
+
+              @Override
+              protected void onActivityResult(int req, int res, Intent data) {
+                  super.onActivityResult(req, res, data);
+                  if (req == 100 && res == RESULT_OK && data != null) {
+                      try {
+                          InputStream in = getContentResolver().openInputStream(data.getData());
+                          File out = new File(getCacheDir(), "custom_plugin.so");
+                          FileOutputStream fos = new FileOutputStream(out);
+                          byte[] buf = new byte[8192]; int n;
+                          while ((n = in.read(buf)) > 0) fos.write(buf, 0, n);
+                          fos.close(); in.close();
+                          customPluginPath = out.getAbsolutePath();
+                          btnAddPlugin.setText("Плагин: загружен");
+                          Toast.makeText(this, "Свой плагин выбран!", Toast.LENGTH_SHORT).show();
+                      } catch (Exception e) {
+                          Toast.makeText(this, "Ошибка: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                      }
+                  }
+              }
+
+              private void doInject(String pkg) {
+                  runOnUiThread(() -> Toast.makeText(this, "Запускаем Oxide...", Toast.LENGTH_SHORT).show());
+                  Shell.cmd("monkey -p " + pkg + " 1").exec();
+
+                  int pid = -1;
+                  long startTime = System.currentTimeMillis();
+                  while (System.currentTimeMillis() - startTime < 15000) {
+                      List<String> out = Shell.cmd("pidof " + pkg).exec().getOut();
+                      if (!out.isEmpty()) {
+                          pid = Integer.parseInt(out.get(0).trim().split(" ")[0]);
+                          break;
+                      }
+                      try { Thread.sleep(300); } catch (Exception ignored) {}
+                  }
+
+                  if (pid == -1) {
+                      runOnUiThread(() -> Toast.makeText(this, "Игра не запустилась", Toast.LENGTH_LONG).show());
+                      return;
+                  }
+
+                  File exeFile = new File(getApplicationInfo().nativeLibraryDir, "libinjector_bin.so");
+                  Shell.cmd("su -c 'cp " + exeFile.getAbsolutePath() + " /data/local/tmp/injector_bin'").exec();
+                  Shell.cmd("su -c 'chmod 755 /data/local/tmp/injector_bin'").exec();
+
+                  String finalPluginPath;
+                  if (customPluginPath != null) {
+                      finalPluginPath = customPluginPath;
+                  } else {
+                      File builtInMod = new File(getApplicationInfo().nativeLibraryDir, "libmodmenu.so");
+                      finalPluginPath = builtInMod.getAbsolutePath();
+                  }
+
+                  Shell.cmd("su -c 'cp " + finalPluginPath + " /data/local/tmp/mod.so'").exec();
+                  Shell.cmd("su -c 'chmod 755 /data/local/tmp/mod.so'").exec();
+                  Shell.cmd("su -c 'chcon u:object_r:system_file:s0 /data/local/tmp/mod.so'").exec();
+
+                  Shell.Result result = Shell.cmd("su -c '/data/local/tmp/injector_bin " + pid + " /data/local/tmp/mod.so'").exec();
+                  
+                  boolean ok = (result.getCode() == 0);
+                  final int fPid = pid;
+                  runOnUiThread(() -> Toast.makeText(this, ok ? "Чит внедрен! PID: " + fPid : "Ошибка внедрения", Toast.LENGTH_LONG).show());
+              }
+          }
+          EOF
+
+          # 9. Запуск сборки
+          cd "$PROJECT_DIR"
+          if [ ! -f "gradlew" ]; then gradle wrapper; fi
+          chmod +x gradlew
+          ./gradlew assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Launcher-APK
+          path: '**/app/build/outputs/apk/debug/app-debug.apk'
