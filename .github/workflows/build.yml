@@ -71,7 +71,7 @@ jobs:
           dependencies { implementation 'com.github.topjohnwu.libsu:core:5.2.2' }
           EOF
           
-          # 4. Клонируем ImGui и библиотеку хуков And64InlineHook
+          # 4. Клонируем ImGui и библиотеку хуков
           cd app/src/main/cpp
           git clone --depth 1 https://github.com/ocornut/imgui.git
           git clone --depth 1 https://github.com/Rprop/And64InlineHook.git
@@ -98,7 +98,7 @@ jobs:
           target_link_libraries(modmenu ${log-lib} ${android-lib} ${EGL-lib} ${GLESv3-lib} dl)
           EOF
           
-          # 6. Код Инжектора (injector_bin.cpp) - ОСТАВЛЯЕМ БЕЗ ИЗМЕНЕНИЙ
+          # 6. Код Инжектора (injector_bin.cpp)
           cat << 'EOF' > injector_bin.cpp
           #include <stdio.h>
           #include <stdlib.h>
@@ -181,7 +181,7 @@ jobs:
           }
           EOF
 
-          # 7. Код Меню (modmenu.cpp) - ТЕПЕРЬ С ХУКОМ НА ОТРИСОВКУ
+          # 7. Код Меню (modmenu.cpp) - ИСПРАВЛЕНО (Добавлен #include <dlfcn.h>)
           cat << 'EOF' > modmenu.cpp
           #include <jni.h>
           #include <android/log.h>
@@ -189,6 +189,7 @@ jobs:
           #include <unistd.h>
           #include <EGL/egl.h>
           #include <GLES3/gl3.h>
+          #include <dlfcn.h>
           #include "imgui/imgui.h"
           #include "imgui/backends/imgui_impl_opengl3.h"
           #include "imgui/backends/imgui_impl_android.h"
@@ -200,54 +201,45 @@ jobs:
           bool aimbot = false;
           bool esp = false;
 
-          // Оригинальная функция eglSwapBuffers
           EGLBoolean (*orig_eglSwapBuffers)(EGLDisplay dpy, EGLSurface surface) = nullptr;
 
-          // Наша функция-хук, которая выполняется вместо оригинальной
           EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
               static bool init = false;
               if (!init) {
                   init = true;
-                  // Инициализация ImGui
                   IMGUI_CHECKVERSION();
                   ImGui::CreateContext();
                   ImGuiIO& io = ImGui::GetIO();
-                  io.DisplaySize = ImVec2((float)1080, (float)2400); // Размер экрана (примерный)
+                  io.DisplaySize = ImVec2((float)1080, (float)2400);
                   ImGui::StyleColorsDark();
                   ImGui_ImplOpenGL3_Init("#version 300 es");
                   ImGui_ImplAndroid_Init(nullptr);
                   LOGI("ImGui Initialized!");
               }
 
-              // Начинаем кадр ImGui
               ImGui_ImplOpenGL3_NewFrame();
               ImGui_ImplAndroid_NewFrame();
               ImGui::NewFrame();
 
-              // Рисуем меню
               ImGui::Begin("ROCKET CHEAT");
               ImGui::Checkbox("Aimbot", &aimbot);
               ImGui::Checkbox("ESP", &esp);
               ImGui::Text("Status: Connected");
               ImGui::End();
 
-              // Завершаем кадр и рендерим
               ImGui::Render();
               ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
-              // Вызываем оригинальную функцию (чтобы игра отрисовала свой кадр)
               return orig_eglSwapBuffers(dpy, surface);
           }
 
           void* menu_thread(void*) {
-              sleep(5); // Ждем загрузки игры
+              sleep(5);
               LOGI("Hooking eglSwapBuffers...");
               
-              // Ищем адрес eglSwapBuffers в памяти игры
               void* handle = dlopen("libEGL.so", RTLD_LAZY);
               void* target = dlsym(handle, "eglSwapBuffers");
               
-              // Ставим хук
               A64HookFunction(target, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
               LOGI("Hook installed!");
 
