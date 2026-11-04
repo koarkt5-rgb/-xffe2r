@@ -23,7 +23,6 @@ jobs:
         with:
           packages: 'platform-tools'
 
-      # Используем NDK r25b, так как он стабильно работает с Dobby
       - name: Install NDK and CMake
         run: |
           sdkmanager "ndk;25.2.9519653" "cmake;3.22.1"
@@ -40,7 +39,7 @@ jobs:
           PROJECT_DIR=$(realpath $(dirname "$SETTINGS_FILE"))
           cd "$PROJECT_DIR"
           
-          # 2. Настройка Gradle
+          # 2. settings.gradle
           cat << 'EOF' > settings.gradle
           pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
           dependencyResolutionManagement {
@@ -51,6 +50,7 @@ jobs:
           include ':app'
           EOF
           
+          # 3. app/build.gradle
           cat << 'EOF' > app/build.gradle
           plugins { id 'com.android.application' }
           android {
@@ -71,22 +71,20 @@ jobs:
           dependencies { implementation 'com.github.topjohnwu.libsu:core:5.2.2' }
           EOF
           
-          # 3. Клонирование ImGui и Dobby
+          # 4. Клонируем ImGui и Dobby
           cd app/src/main/cpp
           git clone --depth 1 https://github.com/ocornut/imgui.git
           git clone --depth 1 https://github.com/jmpews/Dobby.git
           
-          # 4. CMake с правильными путями для Dobby
+          # 5. CMakeLists.txt
           cat << 'EOF' > CMakeLists.txt
           cmake_minimum_required(VERSION 3.22.1)
           project("oxide")
 
-          # Инжектор
           add_executable(injector_bin injector_bin.cpp)
           target_link_libraries(injector_bin log dl)
           set_target_properties(injector_bin PROPERTIES OUTPUT_NAME "injector_bin.so")
 
-          # Настройка Dobby
           if(NOT TARGET dobby)
               set(DOBBY_DIR ${CMAKE_CURRENT_SOURCE_DIR}/Dobby)
               macro(SET_OPTION option value)
@@ -95,27 +93,22 @@ jobs:
               SET_OPTION(DOBBY_DEBUG OFF)
               SET_OPTION(DOBBY_GENERATE_SHARED OFF)
               add_subdirectory(${DOBBY_DIR} dobby)
-              
-              # Получаем пути к заголовкам Dobby
               get_property(DOBBY_INCLUDE_DIRECTORIES TARGET dobby PROPERTY INCLUDE_DIRECTORIES)
           endif()
 
-          # Меню (ImGui + Vulkan)
           add_library(modmenu SHARED modmenu.cpp 
               imgui/imgui.cpp imgui/imgui_draw.cpp imgui/imgui_tables.cpp imgui/imgui_widgets.cpp
               imgui/backends/imgui_impl_vulkan.cpp imgui/backends/imgui_impl_android.cpp
           )
-          # Добавляем пути ImGui и Dobby в компилятор
           target_include_directories(modmenu PRIVATE imgui ${DOBBY_INCLUDE_DIRECTORIES})
 
           find_library(log-lib log)
           find_library(android-lib android)
           find_library(vulkan-lib vulkan)
-
           target_link_libraries(modmenu ${log-lib} ${android-lib} ${vulkan-lib} dl dobby)
           EOF
           
-          # 5. Код Инжектора (injector_bin.cpp)
+          # 6. injector_bin.cpp
           cat << 'EOF' > injector_bin.cpp
           #include <stdio.h>
           #include <stdlib.h>
@@ -192,7 +185,7 @@ jobs:
           }
           EOF
 
-          # 6. Код Меню ImGui (Vulkan + Dobby)
+          # 7. modmenu.cpp (Vulkan + Dobby)
           cat << 'EOF' > modmenu.cpp
           #include <jni.h>
           #include <android/log.h>
@@ -203,64 +196,46 @@ jobs:
           #include "imgui/imgui.h"
           #include "imgui/backends/imgui_impl_vulkan.h"
           #include "imgui/backends/imgui_impl_android.h"
-          #include "dobby.h" // ИСПРАВЛЕНО: прямой инклуд без папки
+          #include "dobby.h"
 
           #define LOG_TAG "OxideCheat"
           #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
           bool isInit = false;
-          VkQueue g_Queue = VK_NULL_HANDLE;
-
           VkResult (*orig_vkQueuePresentKHR)(VkQueue, const VkPresentInfoKHR*) = nullptr;
 
           VkResult hook_vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo) {
               if (!isInit) {
                   isInit = true;
-                  g_Queue = queue;
-                  LOGI("vkQueuePresentKHR hooked, initializing ImGui...");
+                  LOGI("vkQueuePresentKHR hooked!");
                   IMGUI_CHECKVERSION();
                   ImGui::CreateContext();
-                  ImGuiIO& io = ImGui::GetIO();
                   ImGui::StyleColorsDark();
                   ImGui_ImplAndroid_Init(nullptr);
               }
-              
-              // В реальном коде здесь будет отрисовка ImGui
-              // ImGui_ImplVulkan_NewFrame();
-              // ImGui_ImplAndroid_NewFrame();
-              // ImGui::NewFrame();
-              // ImGui::Begin("ROCKET CHEAT");
-              // ImGui::Text("Vulkan Hook Works!");
-              // ImGui::End();
-              // ImGui::Render();
-              // ... (код рендера) ...
-
+              // Здесь будет отрисовка ImGui
               return orig_vkQueuePresentKHR(queue, pPresentInfo);
           }
 
           void* menu_thread(void*) {
               sleep(5); 
-              LOGI("Trying to find vkQueuePresentKHR...");
-              
               void* handle = dlopen("libvulkan.so", RTLD_LAZY);
-              if (!handle) { LOGI("Failed to dlopen libvulkan.so!"); return nullptr; }
-              
+              if (!handle) { LOGI("libvulkan.so not found"); return nullptr; }
               void* target = dlsym(handle, "vkQueuePresentKHR");
-              if (!target) { LOGI("Failed to find vkQueuePresentKHR!"); return nullptr; }
-              
-              LOGI("Found vkQueuePresentKHR at %p. Hooking with Dobby...", target);
+              if (!target) { LOGI("vkQueuePresentKHR not found"); return nullptr; }
+              LOGI("Hooking vkQueuePresentKHR...");
               DobbyHook(target, (void*)hook_vkQueuePresentKHR, (void**)&orig_vkQueuePresentKHR);
-              LOGI("Hook installation finished!");
+              LOGI("Hook installed!");
               return nullptr;
           }
 
           __attribute__((constructor)) void init() {
-              LOGI("Library loaded in game!");
+              LOGI("Library loaded!");
               pthread_t t; pthread_create(&t, nullptr, menu_thread, nullptr);
           }
           EOF
 
-          # 7. Создаем Java файл (MainActivity.java) с обходом DEFEX
+          # 8. MainActivity.java (с bind-mount)
           cd "$PROJECT_DIR"
           mkdir -p app/src/main/java/com/example/oxidelauncher
           cat << 'EOF' > app/src/main/java/com/example/oxidelauncher/MainActivity.java
@@ -363,7 +338,7 @@ jobs:
           }
           EOF
 
-          # 8. Запуск сборки
+          # 9. Сборка
           cd "$PROJECT_DIR"
           if [ ! -f "gradlew" ]; then gradle wrapper; fi
           chmod +x gradlew
