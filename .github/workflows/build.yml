@@ -79,38 +79,50 @@ jobs:
           cp -r ImGuiAndroidVulkanHook/Menu .
           cp -r ImGuiAndroidVulkanHook/Dobby .
           
-          # 4. Создаем CMakeLists.txt (исправленный)
+          # 4. Создаем CMakeLists.txt (исправленный под структуру Kaotic)
           cat << 'EOF' > CMakeLists.txt
           cmake_minimum_required(VERSION 3.22.1)
           project("oxide")
 
-          # Наш инжектор
+          # Наш инжектор (Executable)
           add_executable(injector_bin injector_bin.cpp)
           target_link_libraries(injector_bin log dl)
           set_target_properties(injector_bin PROPERTIES OUTPUT_NAME "injector_bin.so")
 
-          # Подключаем Dobby как предварительно собранную статическую библиотеку
+          # Dobby (готовая статическая библиотека из репозитория)
           add_library(dobby STATIC IMPORTED)
           set_target_properties(dobby PROPERTIES IMPORTED_LOCATION ${CMAKE_SOURCE_DIR}/Dobby/${ANDROID_ABI}/libdobby.a)
 
-          # Меню из ImGuiAndroidVulkanHook
-          add_library(modmenu SHARED
+          # Меню (ImGui + Vulkan) - собираем ровно те файлы, что в оригинале
+          add_library(Menu SHARED
               Menu/Menu.cpp
               Menu/ImGui/imgui.cpp
               Menu/ImGui/imgui_draw.cpp
               Menu/ImGui/imgui_tables.cpp
               Menu/ImGui/imgui_widgets.cpp
+              Menu/ImGui/imgui_demo.cpp
               Menu/ImGui/backends/imgui_impl_android.cpp
               Menu/ImGui/backends/imgui_impl_opengl3.cpp
               Menu/ImGui/backends/imgui_impl_vulkan.cpp
           )
-          target_include_directories(modmenu PRIVATE Menu/ImGui Menu/ImGui/backends Dobby)
+          
+          # Переименовываем выходной файл в libmodmenu.so, чтобы Java его нашла
+          set_target_properties(Menu PROPERTIES OUTPUT_NAME "modmenu")
+          
+          # Добавляем пути к заголовочным файлам
+          target_include_directories(Menu PRIVATE
+              Menu
+              Menu/ImGui
+              Menu/ImGui/backends
+              Dobby
+          )
 
           find_library(log-lib log)
           find_library(android-lib android)
           find_library(vulkan-lib vulkan)
 
-          target_link_libraries(modmenu ${log-lib} ${android-lib} ${vulkan-lib} dl dobby z)
+          # Линкуем Menu с Dobby, Vulkan и системными библиотеками
+          target_link_libraries(Menu ${log-lib} ${android-lib} ${vulkan-lib} dl dobby z)
           EOF
           
           # 5. injector_bin.cpp (без изменений)
