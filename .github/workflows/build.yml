@@ -70,17 +70,38 @@ jobs:
           dependencies { implementation 'com.github.topjohnwu.libsu:core:5.2.2' }
           EOF
           
-          # 3. Клонируем проверенный шаблон Android-Imgui-Template
+          # 3. Клонируем шаблон и ИЩЕМ файлы
           cd app/src/main/cpp
           echo "Клонируем Android-Imgui-Template..."
           git clone --depth 1 https://github.com/traitimtrongvag/Android-Imgui-Template.git temp_template
           
-          # Копируем исходники меню и Dobby из шаблона
-          cp -r temp_template/app/src/main/jni/Menu .
-          cp -r temp_template/app/src/main/jni/Dobby .
+          # Ищем и копируем ImGui
+          echo "Поиск ImGui..."
+          IMGUI_DIR=$(find temp_template -type f -name "imgui.cpp" | head -n 1 | xargs dirname)
+          if [ -z "$IMGUI_DIR" ]; then echo "ImGui не найден!"; exit 1; fi
+          mkdir -p imgui
+          cp -r "$IMGUI_DIR"/* imgui/
+          
+          # Ищем и копируем Dobby
+          echo "Поиск Dobby..."
+          DOBBY_INCLUDE=$(find temp_template -type f -name "dobby.h" | head -n 1 | xargs dirname)
+          if [ -z "$DOBBY_INCLUDE" ]; then echo "Dobby не найден!"; exit 1; fi
+          mkdir -p dobby_include
+          cp -r "$DOBBY_INCLUDE"/* dobby_include/
+          
+          # Ищем и копируем исходники Dobby (если они есть)
+          DOBBY_SRC_DIR=$(find temp_template -type d -name "source" | head -n 1)
+          if [ -n "$DOBBY_SRC_DIR" ]; then
+              mkdir -p dobby_src
+              cp -r "$DOBBY_SRC_DIR"/* dobby_src/
+          else
+              echo "Исходники Dobby не найдены (возможно, используется готовая библиотека)."
+          fi
+          
+          # Удаляем временную папку
           rm -rf temp_template
           
-          # 4. Создаем CMakeLists.txt для сборки меню из шаблона
+          # 4. Создаем CMakeLists.txt, используя найденные пути
           cat << 'EOF' > CMakeLists.txt
           cmake_minimum_required(VERSION 3.22.1)
           project("oxide")
@@ -90,26 +111,13 @@ jobs:
           target_link_libraries(injector_bin log dl)
           set_target_properties(injector_bin PROPERTIES OUTPUT_NAME "injector_bin.so")
 
-          # Меню (ImGui + Dobby) из шаблона
+          # Меню (ImGui + Dobby)
+          # Собираем все .cpp файлы из папки imgui
+          file(GLOB IMGUI_SOURCES "imgui/*.cpp")
+          
           add_library(modmenu SHARED
-              Menu/Menu.cpp
-              Menu/ImGui/imgui.cpp
-              Menu/ImGui/imgui_draw.cpp
-              Menu/ImGui/imgui_tables.cpp
-              Menu/ImGui/imgui_widgets.cpp
-              Menu/ImGui/backends/imgui_impl_android.cpp
-              Menu/ImGui/backends/imgui_impl_opengl3.cpp
-              Dobby/source/Backend/UserMode/UserMode.cpp
-              Dobby/source/Backend/UserMode/PlatformUtil/ProcessRuntime.cpp
-              Dobby/source/Backend/UserMode/PlatformUtil/Posix/ProcessRuntime.cpp
-              Dobby/source/Backend/UserMode/PlatformUtil/Posix/MemoryOperation.cpp
-              Dobby/source/Backend/UserMode/PlatformUtil/Posix/ThreadOperation.cpp
-              Dobby/source/Backend/UserMode/PlatformUtil/Posix/FileOperation.cpp
-              Dobby/source/Backend/UserMode/PlatformUtil/Posix/SymbolOperation.cpp
-              Dobby/source/Backend/UserMode/PlatformUtil/Posix/SignalOperation.cpp
-              Dobby/source/Intercept/InlineHook/InlineHook.cpp
-              Dobby/source/Intercept/InlineHook/ARM64/InlineHook.cpp
-              Dobby/source/Trampoline/ARM64/Trampoline.cpp
+              Menu.cpp  # Мы создадим этот файл ниже
+              ${IMGUI_SOURCES}
           )
           
           # Переименовываем выходной файл в libmodmenu.so
@@ -117,13 +125,10 @@ jobs:
           
           # Пути к заголовочным файлам
           target_include_directories(modmenu PRIVATE
-              Menu
-              Menu/ImGui
-              Menu/ImGui/backends
-              Dobby/include
+              imgui
+              dobby_include
           )
 
-          # Указываем стандарт C++17
           set(CMAKE_CXX_STANDARD 17)
           set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -132,11 +137,36 @@ jobs:
           find_library(EGL-lib EGL)
           find_library(GLESv3-lib GLESv3)
 
-          # Линкуем Menu с системными библиотеками
           target_link_libraries(modmenu ${log-lib} ${android-lib} ${EGL-lib} ${GLESv3-lib} dl)
           EOF
           
-          # 5. injector_bin.cpp (без изменений)
+          # 5. Создаем простой Menu.cpp (заглушка для меню)
+          cat << 'EOF' > Menu.cpp
+          #include <android/log.h>
+          #include <pthread.h>
+          #include <unistd.h>
+          #include "imgui.h"
+
+          #define LOG_TAG "OxideMenu"
+          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+
+          bool isInit = false;
+
+          void* menu_thread(void*) {
+              sleep(3);
+              LOGI("Menu thread started (заглушка).");
+              // Здесь будет код инициализации ImGui и хуков
+              return nullptr;
+          }
+
+          __attribute__((constructor)) void init() {
+              LOGI("Menu library loaded!");
+              pthread_t t;
+              pthread_create(&t, nullptr, menu_thread, nullptr);
+          }
+          EOF
+          
+          # 6. injector_bin.cpp (без изменений)
           cat << 'EOF' > injector_bin.cpp
           #include <stdio.h>
           #include <stdlib.h>
@@ -215,7 +245,7 @@ jobs:
           }
           EOF
 
-          # 6. MainActivity.java (без изменений)
+          # 7. MainActivity.java (без изменений)
           cd "$PROJECT_DIR"
           mkdir -p app/src/main/java/com/example/oxidelauncher
           cat << 'EOF' > app/src/main/java/com/example/oxidelauncher/MainActivity.java
@@ -289,7 +319,7 @@ jobs:
           }
           EOF
 
-          # 7. Сборка
+          # 8. Сборка
           cd "$PROJECT_DIR"
           if [ ! -f "gradlew" ]; then gradle wrapper; fi
           chmod +x gradlew
