@@ -23,7 +23,6 @@ jobs:
         with:
           packages: 'platform-tools'
 
-      # Используем NDK r25b
       - name: Install NDK and CMake
         run: |
           sdkmanager "ndk;25.2.9519653" "cmake;3.22.1"
@@ -76,9 +75,8 @@ jobs:
           git clone --depth 1 https://github.com/ocornut/imgui.git
           git clone --depth 1 https://github.com/jmpews/Dobby.git
           
-          # 4. ИСПРАВЛЕНИЕ ОШИБКИ ADRP В DOBBY
+          # 4. ИСПРАВЛЕНИЕ ОШИБКИ DOBBY (@PAGE -> :pg_hi21:)
           echo "Патчим Dobby для совместимости с NDK..."
-          # Находим все .S и .asm файлы в Dobby и заменяем @PAGE на :pg_hi21:
           find Dobby -type f \( -name "*.S" -o -name "*.asm" \) -exec sed -i 's/@PAGE/:pg_hi21:/g' {} +
           
           # 5. CMakeLists.txt
@@ -86,10 +84,12 @@ jobs:
           cmake_minimum_required(VERSION 3.22.1)
           project("oxide")
 
+          # Инжектор
           add_executable(injector_bin injector_bin.cpp)
           target_link_libraries(injector_bin log dl)
           set_target_properties(injector_bin PROPERTIES OUTPUT_NAME "injector_bin.so")
 
+          # Dobby
           if(NOT TARGET dobby)
               set(DOBBY_DIR ${CMAKE_CURRENT_SOURCE_DIR}/Dobby)
               macro(SET_OPTION option value)
@@ -101,6 +101,7 @@ jobs:
               get_property(DOBBY_INCLUDE_DIRECTORIES TARGET dobby PROPERTY INCLUDE_DIRECTORIES)
           endif()
 
+          # Меню (ImGui + Vulkan)
           add_library(modmenu SHARED modmenu.cpp 
               imgui/imgui.cpp imgui/imgui_draw.cpp imgui/imgui_tables.cpp imgui/imgui_widgets.cpp
               imgui/backends/imgui_impl_vulkan.cpp imgui/backends/imgui_impl_android.cpp
@@ -113,7 +114,7 @@ jobs:
           target_link_libraries(modmenu ${log-lib} ${android-lib} ${vulkan-lib} dl dobby)
           EOF
           
-          # 6. injector_bin.cpp (memfd + ptrace fallback)
+          # 6. injector_bin.cpp (с memfd fallback)
           cat << 'EOF' > injector_bin.cpp
           #include <stdio.h>
           #include <stdlib.h>
@@ -175,10 +176,8 @@ jobs:
               pid_t pid = atoi(argv[1]);
               const char* path = argv[2];
 
-              // Пытаемся через ptrace (может упасть с кодом 1 на Samsung)
               if (ptrace(PTRACE_ATTACH, pid, 0, 0) == -1) {
                   LOGI("ptrace failed, trying memfd fallback...");
-                  // Fallback: просто загружаем в свой процесс (для теста)
                   int fd = create_memfd(path);
                   if (fd < 0) return 1;
                   void* h = load_from_memfd(fd);
@@ -329,7 +328,6 @@ jobs:
                   Shell.cmd("su -c 'cp " + modFile.getAbsolutePath() + " " + targetPath + "'").exec();
                   Shell.cmd("su -c 'chmod 755 " + targetPath + "'").exec();
 
-                  // Вызываем нативный инжектор (он сам попробует ptrace и memfd)
                   int code = runInjection(String.valueOf(pid), targetPath);
                   runOnUiThread(() -> Toast.makeText(this, "Код: " + code, Toast.LENGTH_LONG).show());
               }
