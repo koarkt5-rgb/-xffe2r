@@ -23,14 +23,14 @@ jobs:
         with:
           packages: 'platform-tools'
 
-      # 1. ИСПРАВЛЕНИЕ: Используем стабильную версию NDK r25b для совместимости с Dobby
+      # Используем NDK r25b, так как он стабильно работает с Dobby
       - name: Install NDK and CMake
         run: |
           sdkmanager "ndk;25.2.9519653" "cmake;3.22.1"
 
       - name: Build Everything Automatically
         run: |
-          # 2. Распаковка архива
+          # 1. Распаковка архива
           mkdir -p build_dir
           if ls *.zip 1> /dev/null 2>&1; then unzip -o *.zip -d build_dir
           elif ls *.7z 1> /dev/null 2>&1; then sudo apt-get update && sudo apt-get install -y p7zip-full; 7z x *.7z -obuild_dir
@@ -40,7 +40,7 @@ jobs:
           PROJECT_DIR=$(realpath $(dirname "$SETTINGS_FILE"))
           cd "$PROJECT_DIR"
           
-          # 3. Настройка Gradle (указываем версию NDK r25b)
+          # 2. Настройка Gradle
           cat << 'EOF' > settings.gradle
           pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
           dependencyResolutionManagement {
@@ -71,22 +71,22 @@ jobs:
           dependencies { implementation 'com.github.topjohnwu.libsu:core:5.2.2' }
           EOF
           
-          # 4. Клонирование ImGui и Dobby
+          # 3. Клонирование ImGui и Dobby
           cd app/src/main/cpp
           git clone --depth 1 https://github.com/ocornut/imgui.git
           git clone --depth 1 https://github.com/jmpews/Dobby.git
           
-          # 5. ИСПРАВЛЕНИЕ: Правильный CMakeLists.txt для Dobby
+          # 4. CMake с правильными путями для Dobby
           cat << 'EOF' > CMakeLists.txt
           cmake_minimum_required(VERSION 3.22.1)
           project("oxide")
 
-          # Инжектор (Executable)
+          # Инжектор
           add_executable(injector_bin injector_bin.cpp)
           target_link_libraries(injector_bin log dl)
           set_target_properties(injector_bin PROPERTIES OUTPUT_NAME "injector_bin.so")
 
-          # === НАСТРОЙКА DOBBY (Стандартный подход) ===
+          # Настройка Dobby
           if(NOT TARGET dobby)
               set(DOBBY_DIR ${CMAKE_CURRENT_SOURCE_DIR}/Dobby)
               macro(SET_OPTION option value)
@@ -95,27 +95,27 @@ jobs:
               SET_OPTION(DOBBY_DEBUG OFF)
               SET_OPTION(DOBBY_GENERATE_SHARED OFF)
               add_subdirectory(${DOBBY_DIR} dobby)
+              
+              # Получаем пути к заголовкам Dobby
               get_property(DOBBY_INCLUDE_DIRECTORIES TARGET dobby PROPERTY INCLUDE_DIRECTORIES)
-              include_directories(. ${DOBBY_INCLUDE_DIRECTORIES} $<TARGET_PROPERTY:dobby,INCLUDE_DIRECTORIES>)
           endif()
-          # ============================================
 
           # Меню (ImGui + Vulkan)
           add_library(modmenu SHARED modmenu.cpp 
               imgui/imgui.cpp imgui/imgui_draw.cpp imgui/imgui_tables.cpp imgui/imgui_widgets.cpp
               imgui/backends/imgui_impl_vulkan.cpp imgui/backends/imgui_impl_android.cpp
           )
-          target_include_directories(modmenu PRIVATE imgui)
+          # Добавляем пути ImGui и Dobby в компилятор
+          target_include_directories(modmenu PRIVATE imgui ${DOBBY_INCLUDE_DIRECTORIES})
 
           find_library(log-lib log)
           find_library(android-lib android)
           find_library(vulkan-lib vulkan)
-          
-          # Линкуем с Dobby
+
           target_link_libraries(modmenu ${log-lib} ${android-lib} ${vulkan-lib} dl dobby)
           EOF
           
-          # 6. Код Инжектора (injector_bin.cpp)
+          # 5. Код Инжектора (injector_bin.cpp)
           cat << 'EOF' > injector_bin.cpp
           #include <stdio.h>
           #include <stdlib.h>
@@ -192,7 +192,7 @@ jobs:
           }
           EOF
 
-          # 7. Код Меню ImGui (Vulkan + Dobby)
+          # 6. Код Меню ImGui (Vulkan + Dobby)
           cat << 'EOF' > modmenu.cpp
           #include <jni.h>
           #include <android/log.h>
@@ -203,7 +203,7 @@ jobs:
           #include "imgui/imgui.h"
           #include "imgui/backends/imgui_impl_vulkan.h"
           #include "imgui/backends/imgui_impl_android.h"
-          #include "Dobby/dobby.h"
+          #include "dobby.h" // ИСПРАВЛЕНО: прямой инклуд без папки
 
           #define LOG_TAG "OxideCheat"
           #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -223,11 +223,9 @@ jobs:
                   ImGuiIO& io = ImGui::GetIO();
                   ImGui::StyleColorsDark();
                   ImGui_ImplAndroid_Init(nullptr);
-                  // Полная инициализация Vulkan рендерера для ImGui требует создания render pass и других ресурсов.
-                  // В этом примере мы только проверяем, что хук работает.
               }
               
-              // Пример отрисовки (в реальном проекте требует полной настройки Vulkan)
+              // В реальном коде здесь будет отрисовка ImGui
               // ImGui_ImplVulkan_NewFrame();
               // ImGui_ImplAndroid_NewFrame();
               // ImGui::NewFrame();
@@ -235,7 +233,7 @@ jobs:
               // ImGui::Text("Vulkan Hook Works!");
               // ImGui::End();
               // ImGui::Render();
-              // ... (код записи команд в command buffer и отправки в очередь) ...
+              // ... (код рендера) ...
 
               return orig_vkQueuePresentKHR(queue, pPresentInfo);
           }
@@ -262,7 +260,7 @@ jobs:
           }
           EOF
 
-          # 8. Создаем Java файл (MainActivity.java) с обходом DEFEX
+          # 7. Создаем Java файл (MainActivity.java) с обходом DEFEX
           cd "$PROJECT_DIR"
           mkdir -p app/src/main/java/com/example/oxidelauncher
           cat << 'EOF' > app/src/main/java/com/example/oxidelauncher/MainActivity.java
@@ -365,7 +363,7 @@ jobs:
           }
           EOF
 
-          # 9. Запуск сборки
+          # 8. Запуск сборки
           cd "$PROJECT_DIR"
           if [ ! -f "gradlew" ]; then gradle wrapper; fi
           chmod +x gradlew
