@@ -98,8 +98,9 @@ jobs:
           target_link_libraries(modmenu ${log-lib} ${android-lib} ${EGL-lib} ${GLESv3-lib} dl)
           EOF
           
-          # 6. Код Инжектора (injector_bin.cpp)
+          # 6. Код Инжектора (injector_bin.cpp) - ИСПРАВЛЕНА JNI ФУНКЦИЯ
           cat << 'EOF' > injector_bin.cpp
+          #include <jni.h>
           #include <stdio.h>
           #include <stdlib.h>
           #include <string.h>
@@ -117,8 +118,8 @@ jobs:
           #define LOG_TAG "InjectorBin"
           #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
-          extern "C" int run_injection(const char* pid_str, const char* path) {
-              pid_t pid = atoi(pid_str);
+          // Вспомогательная функция (без JNI)
+          int do_inject(pid_t pid, const char* path) {
               if (ptrace(PTRACE_ATTACH, pid, 0, 0) == -1) return 1; 
               int status; waitpid(pid, &status, 0);
               
@@ -179,9 +180,23 @@ jobs:
               ptrace(PTRACE_DETACH, pid, 0, 0);
               return handle != 0 ? 0 : 6;
           }
+
+          // Экспортируемая функция для Java (JNI)
+          extern "C" JNIEXPORT jint JNICALL
+          Java_com_example_oxidelauncher_MainActivity_runInjection(JNIEnv *env, jobject, jstring pid_str, jstring path_str) {
+              const char* pid_c = env->GetStringUTFChars(pid_str, 0);
+              const char* path = env->GetStringUTFChars(path_str, 0);
+              
+              pid_t pid = atoi(pid_c);
+              int result = do_inject(pid, path);
+              
+              env->ReleaseStringUTFChars(pid_str, pid_c);
+              env->ReleaseStringUTFChars(path_str, path);
+              return result;
+          }
           EOF
 
-          # 7. Код Меню (modmenu.cpp) - ИСПРАВЛЕНО (Добавлен #include <dlfcn.h>)
+          # 7. Код Меню (modmenu.cpp) - С ОТЛАДКОЙ
           cat << 'EOF' > modmenu.cpp
           #include <jni.h>
           #include <android/log.h>
@@ -200,13 +215,19 @@ jobs:
 
           bool aimbot = false;
           bool esp = false;
+          bool isInit = false;
+          int frameCount = 0;
 
           EGLBoolean (*orig_eglSwapBuffers)(EGLDisplay dpy, EGLSurface surface) = nullptr;
 
           EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
-              static bool init = false;
-              if (!init) {
-                  init = true;
+              frameCount++;
+              if (frameCount % 100 == 0) {
+                  LOGI("HOOK IS WORKING! Frame: %d", frameCount);
+              }
+
+              if (!isInit) {
+                  isInit = true;
                   IMGUI_CHECKVERSION();
                   ImGui::CreateContext();
                   ImGuiIO& io = ImGui::GetIO();
@@ -214,7 +235,7 @@ jobs:
                   ImGui::StyleColorsDark();
                   ImGui_ImplOpenGL3_Init("#version 300 es");
                   ImGui_ImplAndroid_Init(nullptr);
-                  LOGI("ImGui Initialized!");
+                  LOGI("ImGui Initialized inside Hook!");
               }
 
               ImGui_ImplOpenGL3_NewFrame();
@@ -222,9 +243,9 @@ jobs:
               ImGui::NewFrame();
 
               ImGui::Begin("ROCKET CHEAT");
+              ImGui::Text("Hook is working!");
               ImGui::Checkbox("Aimbot", &aimbot);
               ImGui::Checkbox("ESP", &esp);
-              ImGui::Text("Status: Connected");
               ImGui::End();
 
               ImGui::Render();
@@ -234,19 +255,29 @@ jobs:
           }
 
           void* menu_thread(void*) {
-              sleep(5);
-              LOGI("Hooking eglSwapBuffers...");
+              sleep(5); // Ждем загрузки игры
+              LOGI("Trying to find eglSwapBuffers...");
               
               void* handle = dlopen("libEGL.so", RTLD_LAZY);
-              void* target = dlsym(handle, "eglSwapBuffers");
+              if (!handle) {
+                  LOGI("Failed to dlopen libEGL.so!");
+                  return nullptr;
+              }
               
+              void* target = dlsym(handle, "eglSwapBuffers");
+              if (!target) {
+                  LOGI("Failed to find eglSwapBuffers!");
+                  return nullptr;
+              }
+              
+              LOGI("Found eglSwapBuffers at %p. Hooking...", target);
               A64HookFunction(target, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
-              LOGI("Hook installed!");
-
+              LOGI("Hook installation finished!");
               return nullptr;
           }
 
           __attribute__((constructor)) void init() {
+              LOGI("Library loaded in game!");
               pthread_t t; pthread_create(&t, nullptr, menu_thread, nullptr);
           }
           EOF
