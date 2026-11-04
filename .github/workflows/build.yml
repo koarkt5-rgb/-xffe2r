@@ -23,7 +23,6 @@ jobs:
         with:
           packages: 'platform-tools'
 
-      # Используем NDK r25b, так как он лучше всего совместим с хуками
       - name: Install NDK and CMake
         run: |
           sdkmanager "ndk;25.2.9519653" "cmake;3.22.1"
@@ -75,21 +74,19 @@ jobs:
           cd app/src/main/cpp
           git clone --depth 1 https://github.com/ocornut/imgui.git
           
-          # Скачиваем предварительно собранную статическую библиотеку Dobby для arm64
           echo "Скачиваем готовую libdobby.a..."
           mkdir -p Dobby/lib/arm64-v8a
           curl -L -o Dobby/lib/arm64-v8a/libdobby.a https://github.com/3equals3/DobbyHook/raw/main/arm64-v8a/libdobby.a
           
-          # Скачиваем заголовочный файл dobby.h
           mkdir -p Dobby/include
           curl -L -o Dobby/include/dobby.h https://raw.githubusercontent.com/jmpews/Dobby/master/include/dobby.h
           
-          # 4. CMakeLists.txt с подключением готовой библиотеки
+          # 4. CMakeLists.txt
           cat << 'EOF' > CMakeLists.txt
           cmake_minimum_required(VERSION 3.22.1)
           project("oxide")
 
-          # Инжектор
+          # Инжектор (Executable)
           add_executable(injector_bin injector_bin.cpp)
           target_link_libraries(injector_bin log dl)
           set_target_properties(injector_bin PROPERTIES OUTPUT_NAME "injector_bin.so")
@@ -100,10 +97,8 @@ jobs:
               imgui/backends/imgui_impl_vulkan.cpp imgui/backends/imgui_impl_android.cpp
           )
           
-          # Подключаем ImGui и Dobby
           target_include_directories(modmenu PRIVATE imgui Dobby/include)
           
-          # Линкуем со статической библиотекой Dobby
           add_library(dobby STATIC IMPORTED)
           set_target_properties(dobby PROPERTIES IMPORTED_LOCATION ${CMAKE_CURRENT_SOURCE_DIR}/Dobby/lib/arm64-v8a/libdobby.a)
           
@@ -111,10 +106,10 @@ jobs:
           find_library(android-lib android)
           find_library(vulkan-lib vulkan)
           
-          target_link_libraries(modmenu ${log-lib} ${android-lib} ${vulkan-lib} dl dobby)
+          target_link_libraries(modmenu ${log-lib} ${android-lib} ${vulkan-lib} dl dobby c++_static)
           EOF
           
-          # 5. injector_bin.cpp (memfd + ptrace fallback)
+          # 5. injector_bin.cpp
           cat << 'EOF' > injector_bin.cpp
           #include <stdio.h>
           #include <stdlib.h>
@@ -128,10 +123,9 @@ jobs:
           #include <linux/elf.h>
           #include <sys/user.h>
           #include <android/log.h>
-          #include <fcntl.h>
-          #include <sys/syscall.h>
+          #include <errno.h>
 
-          #define LOG_TAG "InjectorMemfd"
+          #define LOG_TAG "InjectorBin"
           #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
           uint64_t get_module_base(pid_t pid, const char* module_name) {
@@ -146,43 +140,14 @@ jobs:
               fclose(fp); return base_addr;
           }
 
-          int create_memfd(const char* path) {
-              int fd = syscall(__NR_memfd_create, "mod.so", 0);
-              if (fd < 0) { LOGI("memfd_create failed"); return -1; }
-              FILE* f = fopen(path, "rb");
-              if (!f) { LOGI("fopen failed"); close(fd); return -1; }
-              fseek(f, 0, SEEK_END); long size = ftell(f); fseek(f, 0, SEEK_SET);
-              void* buf = malloc(size); fread(buf, 1, size, f); fclose(f);
-              if (write(fd, buf, size) != size) { free(buf); close(fd); return -1; }
-              free(buf); return fd;
-          }
-
-          void* load_from_memfd(int fd) {
-              void* handle = dlopen("libdl.so", RTLD_LAZY);
-              if (!handle) return NULL;
-              void* func = dlsym(handle, "android_dlopen_ext");
-              if (!func) return NULL;
-              struct android_dlextinfo { uint64_t flags; void* reserved_addr; size_t reserved_size; int relro_fd; int library_fd; off64_t library_fd_offset; void* library_namespace; };
-              struct android_dlextinfo info = {0};
-              info.flags = 0x10; // ANDROID_DLEXT_USE_LIBRARY_FD
-              info.library_fd = fd;
-              typedef void* (*android_dlopen_ext_t)(const char*, int, const struct android_dlextinfo*);
-              android_dlopen_ext_t android_dlopen_ext = (android_dlopen_ext_t)func;
-              return android_dlopen_ext("mod.so", RTLD_NOW, &info);
-          }
-
           int main(int argc, char** argv) {
               if (argc < 3) return 7;
               pid_t pid = atoi(argv[1]);
               const char* path = argv[2];
 
               if (ptrace(PTRACE_ATTACH, pid, 0, 0) == -1) {
-                  LOGI("ptrace failed, trying memfd fallback...");
-                  int fd = create_memfd(path);
-                  if (fd < 0) return 1;
-                  void* h = load_from_memfd(fd);
-                  close(fd);
-                  return h ? 0 : 5;
+                  LOGI("ptrace failed, errno: %d", errno);
+                  return 1;
               }
               int status; waitpid(pid, &status, 0);
               
@@ -223,7 +188,7 @@ jobs:
           }
           EOF
 
-          # 6. modmenu.cpp (ImGui + Vulkan)
+          # 6. modmenu.cpp
           cat << 'EOF' > modmenu.cpp
           #include <jni.h>
           #include <android/log.h>
@@ -272,7 +237,7 @@ jobs:
           }
           EOF
 
-          # 7. MainActivity.java
+          # 7. MainActivity.java (ИСПРАВЛЕНО: убрано System.loadLibrary)
           cd "$PROJECT_DIR"
           mkdir -p app/src/main/java/com/example/oxidelauncher
           cat << 'EOF' > app/src/main/java/com/example/oxidelauncher/MainActivity.java
@@ -287,8 +252,6 @@ jobs:
           import com.topjohnwu.superuser.Shell;
 
           public class MainActivity extends Activity {
-              static { System.loadLibrary("injector_bin"); }
-              public native int runInjection(String pid, String path);
 
               private final String TARGET_PACKAGE = "com.catsbit.oxidesurvivalisland";
 
@@ -323,12 +286,27 @@ jobs:
                       return;
                   }
 
+                  File exeFile = new File(getApplicationInfo().nativeLibraryDir, "injector_bin.so");
                   File modFile = new File(getApplicationInfo().nativeLibraryDir, "libmodmenu.so");
-                  String targetPath = "/data/local/tmp/mod.so";
-                  Shell.cmd("su -c 'cp " + modFile.getAbsolutePath() + " " + targetPath + "'").exec();
-                  Shell.cmd("su -c 'chmod 755 " + targetPath + "'").exec();
 
-                  int code = runInjection(String.valueOf(pid), targetPath);
+                  // Обход Samsung DEFEX (bind-mount logcat)
+                  String cmd = "su -c '"
+                      + "setenforce 0; "
+                      + "echo 0 > /proc/sys/kernel/yama/ptrace_scope; "
+                      + "cp \"" + exeFile.getAbsolutePath() + "\" /data/local/tmp/injector_bin; "
+                      + "chmod 755 /data/local/tmp/injector_bin; "
+                      + "chcon u:object_r:system_file:s0 /data/local/tmp/injector_bin; "
+                      + "cp \"" + modFile.getAbsolutePath() + "\" /data/local/tmp/mod.so; "
+                      + "chmod 755 /data/local/tmp/mod.so; "
+                      + "chcon u:object_r:system_file:s0 /data/local/tmp/mod.so; "
+                      + "mount -o bind /data/local/tmp/injector_bin /system/bin/logcat; "
+                      + "/system/bin/logcat " + pid + " /data/local/tmp/mod.so; "
+                      + "umount /system/bin/logcat"
+                      + "'";
+
+                  Shell.Result result = Shell.cmd(cmd).exec();
+                  int code = result.getCode();
+                  
                   runOnUiThread(() -> Toast.makeText(this, "Код: " + code, Toast.LENGTH_LONG).show());
               }
           }
