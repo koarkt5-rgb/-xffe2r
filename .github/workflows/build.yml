@@ -1,34 +1,54 @@
 name: Build APK
 
 on:
+  push:
+    branches: [ "main" ]
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - name: Unzip project
-        run: |
-          ZIPFILE=$(find . -iname "*.zip" | head -n 1)
-          unzip -o "$ZIPFILE" -d extracted
-
-      - uses: actions/setup-java@v4
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
         with:
-          distribution: temurin
-          java-version: 17
+          distribution: 'temurin'
+          java-version: '17'
 
-      - name: Accept Android SDK licenses
-        run: yes | sdkmanager --licenses || true
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
 
-      - name: Build
+      - name: Unzip if needed
         run: |
-          PROJECT_DIR=$(find extracted -maxdepth 2 -name "settings.gradle" -exec dirname {} \;)
-          cd "$PROJECT_DIR"
-          gradle assembleDebug
+          # Проверяем, есть ли zip-архив. Если есть - распаковываем.
+          if ls *.zip 1> /dev/null 2>&1; then
+            echo "Найден архив, распаковываем..."
+            unzip -o *.zip -d project
+            cd project
+            # Если внутри архива есть еще одна папка, заходим в нее
+            if [ -d "OxideLauncher" ]; then cd OxideLauncher; fi
+          else
+            echo "Архив не найден, используем файлы из корня репозитория"
+            mkdir project
+            cp -r * project/ || true
+            cd project
+          fi
 
-      - uses: actions/upload-artifact@v4
+      - name: Build APK
+        run: |
+          cd project
+          # Если файла gradlew нет, генерируем его через установленный Gradle
+          if [ ! -f "gradlew" ]; then
+            gradle wrapper
+          fi
+          chmod +x gradlew
+          ./gradlew assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
         with:
-          name: OxideLauncher-apk
-          path: extracted/**/app-debug.apk
+          name: Launcher-APK
+          path: project/app/build/outputs/apk/debug/app-debug.apk
