@@ -50,7 +50,7 @@ jobs:
           include ':app'
           EOF
           
-          # 3. Перезаписываем app/build.gradle
+          # 3. Перезаписываем app/build.gradle (ДОБАВЛЕН abiFilters ТОЛЬКО ДЛЯ 64-БИТ)
           cat << 'EOF' > app/build.gradle
           plugins { id 'com.android.application' }
           android {
@@ -63,6 +63,9 @@ jobs:
                   targetSdk 34
                   versionCode 1
                   versionName "1.0"
+                  ndk {
+                      abiFilters 'arm64-v8a' // Собираем только под 64-бит
+                  }
               }
               externalNativeBuild { cmake { path "src/main/cpp/CMakeLists.txt"; version "3.22.1" } }
               compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
@@ -100,7 +103,7 @@ jobs:
               char line[512]; uint64_t base_addr = 0;
               while (fgets(line, sizeof(line), fp)) {
                   if (strstr(line, module_name) && strstr(line, "r-xp")) {
-                      sscanf(line, "%lx-%*lx %*s %*lx %*s %*s", &base_addr); break;
+                      sscanf(line, "%llx-%*llx %*s %*llx %*s %*s", &base_addr); break;
                   }
               }
               fclose(fp); return base_addr;
@@ -146,7 +149,7 @@ jobs:
           }
           EOF
 
-          # 5. Создаем Java файл, который сам ищет Oxide и делает инжект
+          # 5. Создаем Java файл
           mkdir -p app/src/main/java/com/example/oxidelauncher
           cat << 'EOF' > app/src/main/java/com/example/oxidelauncher/MainActivity.java
           package com.example.oxidelauncher;
