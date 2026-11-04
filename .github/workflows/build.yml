@@ -18,35 +18,41 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
+      # 1. Обновленный экшен + явное указание пакетов (без legacy tools)
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
 
+      # 2. Устанавливаем NDK и CMake, которые нужны для сборки C++
+      - name: Install NDK and CMake
+        run: |
+          sdkmanager "ndk;27.0.12077973" "cmake;3.22.1"
+
+      # 3. Распаковка архива (если он есть)
       - name: Unzip if needed
         run: |
-          # Проверяем, есть ли zip-архив. Если есть - распаковываем.
           if ls *.zip 1> /dev/null 2>&1; then
-            echo "Найден архив, распаковываем..."
             unzip -o *.zip -d project
             cd project
-            # Если внутри архива есть еще одна папка, заходим в нее
             if [ -d "OxideLauncher" ]; then cd OxideLauncher; fi
           else
-            echo "Архив не найден, используем файлы из корня репозитория"
             mkdir project
             cp -r * project/ || true
             cd project
           fi
 
+      # 4. Сборка APK
       - name: Build APK
         run: |
           cd project
-          # Если файла gradlew нет, генерируем его через установленный Gradle
           if [ ! -f "gradlew" ]; then
             gradle wrapper
           fi
           chmod +x gradlew
           ./gradlew assembleDebug
 
+      # 5. Загрузка готового APK
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
