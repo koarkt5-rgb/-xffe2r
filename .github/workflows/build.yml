@@ -29,7 +29,7 @@ jobs:
 
       - name: Build Everything Automatically
         run: |
-          # 1. Распаковка
+          # 1. Распаковка архива лаунчера
           mkdir -p build_dir
           if ls *.zip 1> /dev/null 2>&1; then unzip -o *.zip -d build_dir
           elif ls *.7z 1> /dev/null 2>&1; then sudo apt-get update && sudo apt-get install -y p7zip-full; 7z x *.7z -obuild_dir
@@ -70,25 +70,19 @@ jobs:
           dependencies { implementation 'com.github.topjohnwu.libsu:core:5.2.2' }
           EOF
           
-          # 3. ImGui и хуки
+          # 3. ImGui
           cd app/src/main/cpp
           git clone --depth 1 https://github.com/ocornut/imgui.git
-          git clone --depth 1 https://github.com/Rprop/And64InlineHook.git
           
           cat << 'EOF' > CMakeLists.txt
           cmake_minimum_required(VERSION 3.22.1)
           project("oxide")
 
-          add_executable(injector_bin injector_bin.cpp)
-          target_link_libraries(injector_bin log dl)
-          set_target_properties(injector_bin PROPERTIES OUTPUT_NAME "injector_bin.so")
-
           add_library(modmenu SHARED modmenu.cpp 
               imgui/imgui.cpp imgui/imgui_draw.cpp imgui/imgui_tables.cpp imgui/imgui_widgets.cpp
               imgui/backends/imgui_impl_opengl3.cpp imgui/backends/imgui_impl_android.cpp
-              And64InlineHook/And64InlineHook.cpp
           )
-          target_include_directories(modmenu PRIVATE imgui And64InlineHook)
+          target_include_directories(modmenu PRIVATE imgui)
 
           set(CMAKE_CXX_STANDARD 17)
           set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -100,86 +94,7 @@ jobs:
           target_link_libraries(modmenu ${log-lib} ${android-lib} ${EGL-lib} ${GLESv3-lib} dl)
           EOF
           
-          # 4. Инжектор (без изменений)
-          cat << 'EOF' > injector_bin.cpp
-          #include <stdio.h>
-          #include <stdlib.h>
-          #include <string.h>
-          #include <unistd.h>
-          #include <sys/ptrace.h>
-          #include <sys/wait.h>
-          #include <sys/mman.h>
-          #include <sys/uio.h>
-          #include <dlfcn.h>
-          #include <linux/elf.h>
-          #include <sys/user.h>
-          #include <android/log.h>
-          #include <errno.h>
-
-          #define LOG_TAG "InjectorBin"
-          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
-
-          uint64_t get_module_base(pid_t pid, const char* module_name) {
-              char filename[64]; snprintf(filename, sizeof(filename), "/proc/%d/maps", pid);
-              FILE* fp = fopen(filename, "r"); if (!fp) return 0;
-              char line[512]; uint64_t base_addr = 0;
-              while (fgets(line, sizeof(line), fp)) {
-                  if (strstr(line, module_name) && strstr(line, "r-xp")) {
-                      sscanf(line, "%lx-%*lx %*s %*lx %*s %*s", &base_addr); break;
-                  }
-              }
-              fclose(fp); return base_addr;
-          }
-
-          int main(int argc, char** argv) {
-              if (argc < 3) return 7;
-              pid_t pid = atoi(argv[1]);
-              const char* path = argv[2];
-
-              if (ptrace(PTRACE_ATTACH, pid, 0, 0) == -1) {
-                  LOGI("ptrace failed, errno: %d", errno);
-                  return 1;
-              }
-              int status; waitpid(pid, &status, 0);
-              
-              uint64_t target_libc_base = get_module_base(pid, "libc.so");
-              if (!target_libc_base) { ptrace(PTRACE_DETACH, pid, 0, 0); return 2; }
-              void* local_libc = dlopen("libc.so", RTLD_LAZY);
-              uint64_t local_libc_base = get_module_base(getpid(), "libc.so");
-              uint64_t target_mmap = target_libc_base + ((uint64_t)dlsym(local_libc, "mmap") - local_libc_base);
-              uint64_t target_dlopen = target_libc_base + ((uint64_t)dlsym(local_libc, "dlopen") - local_libc_base);
-
-              struct user_pt_regs regs;
-              struct iovec io = { .iov_base = &regs, .iov_len = sizeof(regs) };
-              if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &io) == -1) { ptrace(PTRACE_DETACH, pid, 0, 0); return 3; }
-              struct user_pt_regs saved_regs = regs;
-
-              uint64_t mmap_args[] = {0, 256, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, (uint64_t)-1, 0};
-              for(int i=0; i<6; i++) regs.regs[i] = mmap_args[i];
-              regs.pc = target_mmap;
-              ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &io);
-              ptrace(PTRACE_CONT, pid, 0, 0);
-              waitpid(pid, &status, 0);
-              ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &io);
-              uint64_t remote_mem = regs.regs[0];
-              if (!remote_mem) { ptrace(PTRACE_DETACH, pid, 0, 0); return 4; }
-
-              struct iovec local_iov = { .iov_base = (void*)path, .iov_len = strlen(path) + 1 };
-              struct iovec remote_iov = { .iov_base = (void*)remote_mem, .iov_len = strlen(path) + 1 };
-              process_vm_writev(pid, &local_iov, 1, &remote_iov, 1, 0);
-
-              regs = saved_regs; regs.regs[0] = remote_mem; regs.regs[1] = RTLD_NOW; regs.pc = target_dlopen;
-              ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &io);
-              ptrace(PTRACE_CONT, pid, 0, 0); waitpid(pid, &status, 0);
-              ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &io);
-              uint64_t handle = regs.regs[0];
-              ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &io);
-              ptrace(PTRACE_DETACH, pid, 0, 0);
-              return handle != 0 ? 0 : 5;
-          }
-          EOF
-
-          # 5. Код Меню + ESP (с чтением файла команд)
+          # 4. Наш код меню (modmenu.cpp) - С JNI_OnLoad
           cat << 'EOF' > modmenu.cpp
           #include <jni.h>
           #include <android/log.h>
@@ -188,39 +103,20 @@ jobs:
           #include <EGL/egl.h>
           #include <GLES3/gl3.h>
           #include <dlfcn.h>
-          #include <fstream>
-          #include <string>
           #include "imgui/imgui.h"
           #include "imgui/backends/imgui_impl_opengl3.h"
           #include "imgui/backends/imgui_impl_android.h"
-          #include "And64InlineHook.hpp"
 
           #define LOG_TAG "OxideCheat"
           #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
           bool isInit = false;
-          bool espEnabled = true;
-          uintptr_t base = 0;
-
-          // Чтение команд из файла, который пишет Overlay-меню
-          void CheckCommands() {
-              std::ifstream file("/sdcard/Download/rocket_cmd.txt");
-              if (file.is_open()) {
-                  std::string line;
-                  while (std::getline(file, line)) {
-                      if (line.find("ESP=1") != std::string::npos) espEnabled = true;
-                      if (line.find("ESP=0") != std::string::npos) espEnabled = false;
-                  }
-                  file.close();
-              }
-          }
-
           EGLBoolean (*orig_eglSwapBuffers)(EGLDisplay dpy, EGLSurface surface) = nullptr;
 
           EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
               if (!isInit) {
                   isInit = true;
-                  LOGI("Init ImGui...");
+                  LOGI("Инициализация ImGui!");
                   IMGUI_CHECKVERSION();
                   ImGui::CreateContext();
                   ImGuiIO& io = ImGui::GetIO();
@@ -230,15 +126,14 @@ jobs:
                   ImGui_ImplAndroid_Init(nullptr);
               }
 
-              CheckCommands();
-
               ImGui_ImplOpenGL3_NewFrame();
               ImGui_ImplAndroid_NewFrame();
               ImGui::NewFrame();
 
-              if (espEnabled) {
-                  ImGui::GetBackgroundDrawList()->AddRect(ImVec2(100, 100), ImVec2(200, 200), IM_COL32(255, 0, 0, 255));
-              }
+              ImGui::Begin("ROCKET CHEAT");
+              ImGui::Text("ESP Test Active");
+              ImGui::GetBackgroundDrawList()->AddRect(ImVec2(100, 100), ImVec2(200, 200), IM_COL32(255, 0, 0, 255));
+              ImGui::End();
 
               ImGui::Render();
               ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
@@ -256,193 +151,16 @@ jobs:
               return nullptr;
           }
 
-          __attribute__((constructor)) void init() {
-              pthread_t t; pthread_create(&t, nullptr, menu_thread, nullptr);
+          // ЭТА ФУНКЦИЯ НУЖНА ИХ ИНЖЕКТОРУ!
+          JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
+              LOGI("JNI_OnLoad вызван!");
+              pthread_t t;
+              pthread_create(&t, nullptr, menu_thread, nullptr);
+              return JNI_VERSION_1_6;
           }
           EOF
 
-          # 6. MainActivity.java (Запуск игры + Overlay)
-          cd "$PROJECT_DIR"
-          mkdir -p app/src/main/java/com/example/oxidelauncher
-          cat << 'EOF' > app/src/main/java/com/example/oxidelauncher/MainActivity.java
-          package com.example.oxidelauncher;
-
-          import android.app.Activity;
-          import android.content.Intent;
-          import android.net.Uri;
-          import android.os.Bundle;
-          import android.provider.Settings;
-          import android.widget.TextView;
-          import android.widget.Toast;
-          import java.io.File;
-          import java.util.List;
-          import com.topjohnwu.superuser.Shell;
-
-          public class MainActivity extends Activity {
-              private final String TARGET_PACKAGE = "com.catsbit.oxidesurvivalisland";
-
-              @Override
-              protected void onCreate(Bundle savedInstanceState) {
-                  super.onCreate(savedInstanceState);
-                  setContentView(R.layout.activity_main);
-
-                  TextView btnLaunch = findViewById(R.id.btnLaunch);
-                  findViewById(R.id.btnAddPlugin).setVisibility(TextView.GONE);
-
-                  btnLaunch.setOnClickListener(v -> {
-                      if (!Settings.canDrawOverlays(this)) {
-                          Intent intent = new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + getPackageName()));
-                          startActivityForResult(intent, 101);
-                      } else {
-                          startAll();
-                      }
-                  });
-              }
-
-              @Override
-              protected void onActivityResult(int requestCode, int resultCode, Intent data) {
-                  super.onActivityResult(requestCode, resultCode, data);
-                  if (requestCode == 101 && Settings.canDrawOverlays(this)) {
-                      startAll();
-                  }
-              }
-
-              private void startAll() {
-                  new Thread(() -> {
-                      runOnUiThread(() -> Toast.makeText(this, "Запуск...", Toast.LENGTH_SHORT).show());
-                      Shell.cmd("monkey -p " + TARGET_PACKAGE + " 1").exec();
-                      try { Thread.sleep(5000); } catch (Exception ignored) {}
-
-                      int pid = -1;
-                      List<String> out = Shell.cmd("pidof " + TARGET_PACKAGE).exec().getOut();
-                      if (!out.isEmpty()) pid = Integer.parseInt(out.get(0).trim());
-
-                      if (pid != -1) {
-                          File modFile = new File(getApplicationInfo().nativeLibraryDir, "libmodmenu.so");
-                          File exeFile = new File(getApplicationInfo().nativeLibraryDir, "injector_bin.so");
-                          Shell.cmd("su -c 'cp " + modFile.getAbsolutePath() + " /data/local/tmp/mod.so'").exec();
-                          Shell.cmd("su -c 'cp " + exeFile.getAbsolutePath() + " /data/local/tmp/injector_bin'").exec();
-                          Shell.cmd("su -c 'chmod 755 /data/local/tmp/injector_bin /data/local/tmp/mod.so'").exec();
-                          Shell.cmd("su -c 'mount -o bind /data/local/tmp/injector_bin /system/bin/logcat'").exec();
-                          Shell.cmd("su -c '/system/bin/logcat " + pid + " /data/local/tmp/mod.so'").exec();
-                          Shell.cmd("su -c 'umount /system/bin/logcat'").exec();
-                      }
-                      // Запускаем Overlay-меню
-                      startService(new Intent(this, FloatingService.class));
-                  }).start();
-              }
-          }
-          EOF
-
-          # 7. FloatingService.java (Overlay меню)
-          cat << 'EOF' > app/src/main/java/com/example/oxidelauncher/FloatingService.java
-          package com.example.oxidelauncher;
-
-          import android.app.Service;
-          import android.content.Intent;
-          import android.graphics.Color;
-          import android.graphics.PixelFormat;
-          import android.os.IBinder;
-          import android.view.Gravity;
-          import android.view.MotionEvent;
-          import android.view.View;
-          import android.view.WindowManager;
-          import android.widget.Button;
-          import android.widget.LinearLayout;
-          import android.widget.Toast;
-          import java.io.File;
-          import java.io.FileOutputStream;
-
-          public class FloatingService extends Service {
-              private WindowManager windowManager;
-              private View floatingView;
-
-              @Override
-              public IBinder onBind(Intent intent) { return null; }
-
-              @Override
-              public void onCreate() {
-                  super.onCreate();
-                  windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
-
-                  LinearLayout layout = new LinearLayout(this);
-                  layout.setOrientation(LinearLayout.VERTICAL);
-                  layout.setBackgroundColor(Color.parseColor("#CC000000"));
-                  layout.setPadding(40, 40, 40, 40);
-
-                  Button closeBtn = new Button(this);
-                  closeBtn.setText("X Закрыть");
-                  closeBtn.setOnClickListener(v -> stopSelf());
-                  layout.addView(closeBtn);
-
-                  Button title = new Button(this);
-                  title.setText("ROCKET MENU");
-                  layout.addView(title);
-
-                  Button espBtn = new Button(this);
-                  espBtn.setText("ESP: ON");
-                  espBtn.setOnClickListener(v -> {
-                      try {
-                          File file = new File("/sdcard/Download/rocket_cmd.txt");
-                          FileOutputStream fos = new FileOutputStream(file);
-                          fos.write("ESP=1".getBytes());
-                          fos.close();
-                          Toast.makeText(this, "ESP Включен", Toast.LENGTH_SHORT).show();
-                      } catch (Exception e) {}
-                  });
-                  layout.addView(espBtn);
-
-                  final WindowManager.LayoutParams params = new WindowManager.LayoutParams(
-                          WindowManager.LayoutParams.WRAP_CONTENT,
-                          WindowManager.LayoutParams.WRAP_CONTENT,
-                          WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                          WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
-                          PixelFormat.TRANSLUCENT);
-
-                  params.gravity = Gravity.TOP | Gravity.LEFT;
-                  params.x = 100;
-                  params.y = 200;
-
-                  title.setOnTouchListener(new View.OnTouchListener() {
-                      private int initialX, initialY;
-                      private float initialTouchX, initialTouchY;
-
-                      @Override
-                      public boolean onTouch(View v, MotionEvent event) {
-                          switch (event.getAction()) {
-                              case MotionEvent.ACTION_DOWN:
-                                  initialX = params.x; initialY = params.y;
-                                  initialTouchX = event.getRawX(); initialTouchY = event.getRawY();
-                                  return true;
-                              case MotionEvent.ACTION_MOVE:
-                                  params.x = initialX + (int) (event.getRawX() - initialTouchX);
-                                  params.y = initialY + (int) (event.getRawY() - initialTouchY);
-                                  windowManager.updateViewLayout(floatingView, params);
-                                  return true;
-                          }
-                          return false;
-                      }
-                  });
-
-                  floatingView = layout;
-                  windowManager.addView(floatingView, params);
-              }
-
-              @Override
-              public void onDestroy() {
-                  super.onDestroy();
-                  if (floatingView != null) windowManager.removeView(floatingView);
-              }
-          }
-          EOF
-
-          # 8. Разрешение на оверлей
-          MANIFEST="app/src/main/AndroidManifest.xml"
-          if ! grep -q "SYSTEM_ALERT_WINDOW" "$MANIFEST"; then
-              sed -i '/<application/i \    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />' "$MANIFEST"
-          fi
-
-          # 9. Сборка
+          # 5. Сборка
           cd "$PROJECT_DIR"
           if [ ! -f "gradlew" ]; then gradle wrapper; fi
           chmod +x gradlew
