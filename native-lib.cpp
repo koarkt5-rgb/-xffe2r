@@ -8,13 +8,10 @@
 #include <sys/mman.h>
 #include <sys/uio.h>
 #include <dlfcn.h>
+#include <linux/elf.h>  // Добавлено для NT_PRSTATUS
+#include <sys/user.h>   // Добавлено для структур регистров
 
-struct user_pt_regs {
-    __u64 regs[31];
-    __u64 sp;
-    __u64 pc;
-    __u64 pstate;
-};
+// Структуру user_pt_regs мы удалили, так как она уже встроена в NDK 27!
 
 uint64_t get_module_base(pid_t pid, const char* module_name) {
     char filename[64];
