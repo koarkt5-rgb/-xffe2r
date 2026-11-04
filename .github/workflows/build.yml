@@ -35,8 +35,10 @@ jobs:
           elif ls *.7z 1> /dev/null 2>&1; then sudo apt-get update && sudo apt-get install -y p7zip-full; 7z x *.7z -obuild_dir
           else cp -r . build_dir/; fi
           
+          # Находим папку и делаем ПУТЬ АБСОЛЮТНЫМ
           SETTINGS_FILE=$(find build_dir -name "settings.gradle" | head -n 1)
-          PROJECT_DIR=$(dirname "$SETTINGS_FILE")
+          PROJECT_DIR=$(realpath $(dirname "$SETTINGS_FILE"))
+          echo "Папка проекта: $PROJECT_DIR"
           cd "$PROJECT_DIR"
           
           # 2. Перезаписываем settings.gradle
@@ -71,7 +73,7 @@ jobs:
           dependencies { implementation 'com.github.topjohnwu.libsu:core:5.2.2' }
           EOF
           
-          # 4. Клонируем ImGui с GitHub (чтобы тебе не загружать архивы вручную)
+          # 4. Клонируем ImGui
           cd app/src/main/cpp
           git clone --depth 1 https://github.com/ocornut/imgui.git
           
@@ -180,7 +182,6 @@ jobs:
           void* menu_thread(void*) {
               sleep(5);
               LOGI("MENU LOADED! ImGui Ready.");
-              // В реальном чите здесь будет хук на отрисовку OpenGL
               while(true) {
                   if(aimbot) { /* Логика аима */ }
                   if(esp) { /* Логика есп */ }
@@ -197,6 +198,7 @@ jobs:
           EOF
 
           # 8. Создаем Java файл (MainActivity.java)
+          cd "$PROJECT_DIR" # <--- ВОЗВРАЩАЕМСЯ В КОРЕНЬ ПРОЕКТА
           mkdir -p app/src/main/java/com/example/oxidelauncher
           cat << 'EOF' > app/src/main/java/com/example/oxidelauncher/MainActivity.java
           package com.example.oxidelauncher;
@@ -221,7 +223,6 @@ jobs:
                   setContentView(R.layout.activity_main);
 
                   TextView btnLaunch = findViewById(R.id.btnLaunch);
-                  // Скрываем кнопку плагина, так как он теперь вшит в APK
                   findViewById(R.id.btnAddPlugin).setVisibility(TextView.GONE); 
 
                   Shell.getShell(shell -> {
@@ -253,11 +254,9 @@ jobs:
                       return;
                   }
 
-                  // Берем .so файл прямо из нашего APK
                   File soFile = new File(getApplicationInfo().nativeLibraryDir, "libmodmenu.so");
                   String path = soFile.getAbsolutePath();
 
-                  // Копируем и даем права (на всякий случай)
                   Shell.cmd("su -c 'cp " + path + " /data/local/tmp/mod.so'").exec();
                   Shell.cmd("su -c 'chmod 755 /data/local/tmp/mod.so'").exec();
                   Shell.cmd("su -c 'chcon u:object_r:system_file:s0 /data/local/tmp/mod.so'").exec();
@@ -270,7 +269,7 @@ jobs:
           EOF
 
           # 9. Запуск сборки
-          cd $PROJECT_DIR
+          cd "$PROJECT_DIR"
           if [ ! -f "gradlew" ]; then gradle wrapper; fi
           chmod +x gradlew
           ./gradlew assembleDebug
