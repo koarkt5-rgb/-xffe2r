@@ -71,25 +71,25 @@ jobs:
           dependencies { implementation 'com.github.topjohnwu.libsu:core:5.2.2' }
           EOF
           
-          # 4. Клонируем ImGui
+          # 4. Клонируем ImGui и библиотеку хуков And64InlineHook
           cd app/src/main/cpp
           git clone --depth 1 https://github.com/ocornut/imgui.git
+          git clone --depth 1 https://github.com/Rprop/And64InlineHook.git
           
           # 5. Создаем CMakeLists.txt
           cat << 'EOF' > CMakeLists.txt
           cmake_minimum_required(VERSION 3.22.1)
           project("oxide")
           
-          # Инжектор (Executable)
           add_library(injector_bin SHARED injector_bin.cpp)
           target_link_libraries(injector_bin log dl)
           
-          # Меню (ImGui)
           add_library(modmenu SHARED modmenu.cpp 
               imgui/imgui.cpp imgui/imgui_draw.cpp imgui/imgui_tables.cpp imgui/imgui_widgets.cpp
               imgui/backends/imgui_impl_opengl3.cpp imgui/backends/imgui_impl_android.cpp
+              And64InlineHook/And64InlineHook.cpp
           )
-          target_include_directories(modmenu PRIVATE imgui)
+          target_include_directories(modmenu PRIVATE imgui And64InlineHook)
           
           find_library(log-lib log)
           find_library(android-lib android)
@@ -98,7 +98,7 @@ jobs:
           target_link_libraries(modmenu ${log-lib} ${android-lib} ${EGL-lib} ${GLESv3-lib} dl)
           EOF
           
-          # 6. Код Инжектора (injector_bin.cpp)
+          # 6. Код Инжектора (injector_bin.cpp) - ОСТАВЛЯЕМ БЕЗ ИЗМЕНЕНИЙ
           cat << 'EOF' > injector_bin.cpp
           #include <stdio.h>
           #include <stdlib.h>
@@ -119,18 +119,12 @@ jobs:
 
           extern "C" int run_injection(const char* pid_str, const char* path) {
               pid_t pid = atoi(pid_str);
-              LOGI("Trying to attach to PID: %d", pid);
-
-              if (ptrace(PTRACE_ATTACH, pid, 0, 0) == -1) { 
-                  LOGI("PTRACE_ATTACH failed: %d", errno); 
-                  return 1; 
-              }
+              if (ptrace(PTRACE_ATTACH, pid, 0, 0) == -1) return 1; 
               int status; waitpid(pid, &status, 0);
-              LOGI("Attached successfully!");
-
+              
               char filename[64]; snprintf(filename, sizeof(filename), "/proc/%d/maps", pid);
               FILE* fp = fopen(filename, "r"); 
-              if (!fp) { LOGI("Fail open maps: %d", errno); ptrace(PTRACE_DETACH, pid, 0, 0); return 2; }
+              if (!fp) { ptrace(PTRACE_DETACH, pid, 0, 0); return 2; }
               char line[512]; uint64_t target_libc_base = 0;
               while (fgets(line, sizeof(line), fp)) {
                   if (strstr(line, "libc.so") && strstr(line, "r-xp")) {
@@ -138,7 +132,7 @@ jobs:
                   }
               }
               fclose(fp);
-              if (!target_libc_base) { LOGI("libc.so not found"); ptrace(PTRACE_DETACH, pid, 0, 0); return 3; }
+              if (!target_libc_base) { ptrace(PTRACE_DETACH, pid, 0, 0); return 3; }
 
               void* local_libc = dlopen("libc.so", RTLD_LAZY);
               snprintf(filename, sizeof(filename), "/proc/%d/maps", getpid());
@@ -155,7 +149,7 @@ jobs:
 
               struct user_pt_regs regs;
               struct iovec io = { .iov_base = &regs, .iov_len = sizeof(regs) };
-              if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &io) == -1) { LOGI("GETREGSET fail"); ptrace(PTRACE_DETACH, pid, 0, 0); return 4; }
+              if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &io) == -1) { ptrace(PTRACE_DETACH, pid, 0, 0); return 4; }
               struct user_pt_regs saved_regs = regs;
 
               uint64_t mmap_args[] = {0, 256, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, (uint64_t)-1, 0};
@@ -166,7 +160,7 @@ jobs:
               waitpid(pid, &status, 0);
               ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &io);
               uint64_t remote_mem = regs.regs[0];
-              if (!remote_mem) { LOGI("mmap failed"); ptrace(PTRACE_DETACH, pid, 0, 0); return 5; }
+              if (!remote_mem) { ptrace(PTRACE_DETACH, pid, 0, 0); return 5; }
 
               struct iovec local_iov = { .iov_base = (void*)path, .iov_len = strlen(path) + 1 };
               struct iovec remote_iov = { .iov_base = (void*)remote_mem, .iov_len = strlen(path) + 1 };
@@ -187,21 +181,79 @@ jobs:
           }
           EOF
 
-          # 7. Код Меню (modmenu.cpp)
+          # 7. Код Меню (modmenu.cpp) - ТЕПЕРЬ С ХУКОМ НА ОТРИСОВКУ
           cat << 'EOF' > modmenu.cpp
           #include <jni.h>
           #include <android/log.h>
           #include <pthread.h>
           #include <unistd.h>
+          #include <EGL/egl.h>
+          #include <GLES3/gl3.h>
           #include "imgui/imgui.h"
+          #include "imgui/backends/imgui_impl_opengl3.h"
+          #include "imgui/backends/imgui_impl_android.h"
+          #include "And64InlineHook/And64InlineHook.hpp"
+
           #define LOG_TAG "OxideCheat"
           #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+
+          bool aimbot = false;
+          bool esp = false;
+
+          // Оригинальная функция eglSwapBuffers
+          EGLBoolean (*orig_eglSwapBuffers)(EGLDisplay dpy, EGLSurface surface) = nullptr;
+
+          // Наша функция-хук, которая выполняется вместо оригинальной
+          EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
+              static bool init = false;
+              if (!init) {
+                  init = true;
+                  // Инициализация ImGui
+                  IMGUI_CHECKVERSION();
+                  ImGui::CreateContext();
+                  ImGuiIO& io = ImGui::GetIO();
+                  io.DisplaySize = ImVec2((float)1080, (float)2400); // Размер экрана (примерный)
+                  ImGui::StyleColorsDark();
+                  ImGui_ImplOpenGL3_Init("#version 300 es");
+                  ImGui_ImplAndroid_Init(nullptr);
+                  LOGI("ImGui Initialized!");
+              }
+
+              // Начинаем кадр ImGui
+              ImGui_ImplOpenGL3_NewFrame();
+              ImGui_ImplAndroid_NewFrame();
+              ImGui::NewFrame();
+
+              // Рисуем меню
+              ImGui::Begin("ROCKET CHEAT");
+              ImGui::Checkbox("Aimbot", &aimbot);
+              ImGui::Checkbox("ESP", &esp);
+              ImGui::Text("Status: Connected");
+              ImGui::End();
+
+              // Завершаем кадр и рендерим
+              ImGui::Render();
+              ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
+              // Вызываем оригинальную функцию (чтобы игра отрисовала свой кадр)
+              return orig_eglSwapBuffers(dpy, surface);
+          }
+
           void* menu_thread(void*) {
-              sleep(5);
-              LOGI("MENU LOADED! ImGui Ready.");
-              while(true) { sleep(1); }
+              sleep(5); // Ждем загрузки игры
+              LOGI("Hooking eglSwapBuffers...");
+              
+              // Ищем адрес eglSwapBuffers в памяти игры
+              void* handle = dlopen("libEGL.so", RTLD_LAZY);
+              void* target = dlsym(handle, "eglSwapBuffers");
+              
+              // Ставим хук
+              A64HookFunction(target, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
+              LOGI("Hook installed!");
+
               return nullptr;
           }
+
           __attribute__((constructor)) void init() {
               pthread_t t; pthread_create(&t, nullptr, menu_thread, nullptr);
           }
@@ -227,8 +279,6 @@ jobs:
 
           public class MainActivity extends Activity {
               static { System.loadLibrary("injector_bin"); }
-              
-              // Вызываем C++ функцию напрямую (она сама сделает ptrace)
               public native int runInjection(String pid, String path);
 
               private final String TARGET_PACKAGE = "com.catsbit.oxidesurvivalisland";
@@ -301,19 +351,14 @@ jobs:
                       finalPluginPath = builtInMod.getAbsolutePath();
                   }
 
-                  // Копируем через root и даем права
                   Shell.cmd("su -c 'cp " + finalPluginPath + " /data/local/tmp/mod.so'").exec();
                   Shell.cmd("su -c 'chmod 755 /data/local/tmp/mod.so'").exec();
                   Shell.cmd("su -c 'chcon u:object_r:system_file:s0 /data/local/tmp/mod.so'").exec();
 
-                  // Вызываем C++ код НАПРЯМУЮ (он выполнится с правами рута, т.к. приложение рутованное)
                   int resultCode = runInjection(String.valueOf(pid), "/data/local/tmp/mod.so");
                   
                   final String msg;
-                  if (resultCode == 0) msg = "УСПЕХ! Чит внедрен.";
-                  else if (resultCode == 1) msg = "Ошибка: ptrace attach (SELinux блокирует).";
-                  else if (resultCode == 5) msg = "Ошибка: mmap (нет памяти).";
-                  else if (resultCode == 6) msg = "Ошибка: dlopen (файл битый).";
+                  if (resultCode == 0) msg = "УСПЕХ! Меню загружено (жди 5 сек).";
                   else msg = "Ошибка код: " + resultCode;
 
                   runOnUiThread(() -> Toast.makeText(this, msg, Toast.LENGTH_LONG).show());
