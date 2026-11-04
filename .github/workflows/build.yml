@@ -29,7 +29,7 @@ jobs:
 
       - name: Build Everything Automatically
         run: |
-          # 1. Распаковка архива с дизайном
+          # 1. Распаковка архива с дизайном лаунчера
           mkdir -p build_dir
           if ls *.zip 1> /dev/null 2>&1; then unzip -o *.zip -d build_dir
           elif ls *.7z 1> /dev/null 2>&1; then sudo apt-get update && sudo apt-get install -y p7zip-full; 7z x *.7z -obuild_dir
@@ -70,61 +70,70 @@ jobs:
           dependencies { implementation 'com.github.topjohnwu.libsu:core:5.2.2' }
           EOF
           
-          # 3. Клонируем ImGuiAndroidVulkanHook и копируем нужные папки
+          # 3. Клонируем проверенный шаблон Android-Imgui-Template
           cd app/src/main/cpp
-          echo "Клонируем ImGuiAndroidVulkanHook..."
-          git clone --depth 1 https://github.com/Kaotic/ImGuiAndroidVulkanHook.git
+          echo "Клонируем Android-Imgui-Template..."
+          git clone --depth 1 https://github.com/traitimtrongvag/Android-Imgui-Template.git temp_template
           
-          # Копируем Menu и Dobby в наш проект
-          cp -r ImGuiAndroidVulkanHook/Menu .
-          cp -r ImGuiAndroidVulkanHook/Dobby .
+          # Копируем исходники меню и Dobby из шаблона
+          cp -r temp_template/app/src/main/jni/Menu .
+          cp -r temp_template/app/src/main/jni/Dobby .
+          rm -rf temp_template
           
-          # 4. Создаем CMakeLists.txt (ДОБАВЛЕН C++17)
+          # 4. Создаем CMakeLists.txt для сборки меню из шаблона
           cat << 'EOF' > CMakeLists.txt
-          cmake_minimum_required(VERSION 3.18.1)
-          project("OxideLauncher")
+          cmake_minimum_required(VERSION 3.22.1)
+          project("oxide")
 
-          # ЯВНО УКАЗЫВАЕМ СТАНДАРТ C++17
-          set(CMAKE_CXX_STANDARD 17)
-          set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-          # --- Наш инжектор (Executable) ---
+          # Наш инжектор (Executable)
           add_executable(injector_bin injector_bin.cpp)
           target_link_libraries(injector_bin log dl)
           set_target_properties(injector_bin PROPERTIES OUTPUT_NAME "injector_bin.so")
 
-          # --- Меню из ImGuiAndroidVulkanHook ---
-          add_library(
-              Menu
-              SHARED
+          # Меню (ImGui + Dobby) из шаблона
+          add_library(modmenu SHARED
               Menu/Menu.cpp
               Menu/ImGui/imgui.cpp
-              Menu/ImGui/imgui_demo.cpp
               Menu/ImGui/imgui_draw.cpp
               Menu/ImGui/imgui_tables.cpp
               Menu/ImGui/imgui_widgets.cpp
               Menu/ImGui/backends/imgui_impl_android.cpp
               Menu/ImGui/backends/imgui_impl_opengl3.cpp
-              Menu/ImGui/backends/imgui_impl_vulkan.cpp
+              Dobby/source/Backend/UserMode/UserMode.cpp
+              Dobby/source/Backend/UserMode/PlatformUtil/ProcessRuntime.cpp
+              Dobby/source/Backend/UserMode/PlatformUtil/Posix/ProcessRuntime.cpp
+              Dobby/source/Backend/UserMode/PlatformUtil/Posix/MemoryOperation.cpp
+              Dobby/source/Backend/UserMode/PlatformUtil/Posix/ThreadOperation.cpp
+              Dobby/source/Backend/UserMode/PlatformUtil/Posix/FileOperation.cpp
+              Dobby/source/Backend/UserMode/PlatformUtil/Posix/SymbolOperation.cpp
+              Dobby/source/Backend/UserMode/PlatformUtil/Posix/SignalOperation.cpp
+              Dobby/source/Intercept/InlineHook/InlineHook.cpp
+              Dobby/source/Intercept/InlineHook/ARM64/InlineHook.cpp
+              Dobby/source/Trampoline/ARM64/Trampoline.cpp
           )
-
+          
           # Переименовываем выходной файл в libmodmenu.so
-          set_target_properties(Menu PROPERTIES OUTPUT_NAME "modmenu")
-
-          # Подключаем Dobby как предварительно собранную статическую библиотеку
-          add_library(dobby STATIC IMPORTED)
-          set_target_properties(dobby PROPERTIES IMPORTED_LOCATION ${CMAKE_SOURCE_DIR}/Dobby/${ANDROID_ABI}/libdobby.a)
-
+          set_target_properties(modmenu PROPERTIES OUTPUT_NAME "modmenu")
+          
           # Пути к заголовочным файлам
-          target_include_directories(Menu PRIVATE
+          target_include_directories(modmenu PRIVATE
               Menu
               Menu/ImGui
               Menu/ImGui/backends
-              Dobby
+              Dobby/include
           )
 
-          # Линкуем Menu с Dobby и системными библиотеками
-          target_link_libraries(Menu PRIVATE dobby log android z vulkan)
+          # Указываем стандарт C++17
+          set(CMAKE_CXX_STANDARD 17)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+          find_library(log-lib log)
+          find_library(android-lib android)
+          find_library(EGL-lib EGL)
+          find_library(GLESv3-lib GLESv3)
+
+          # Линкуем Menu с системными библиотеками
+          target_link_libraries(modmenu ${log-lib} ${android-lib} ${EGL-lib} ${GLESv3-lib} dl)
           EOF
           
           # 5. injector_bin.cpp (без изменений)
