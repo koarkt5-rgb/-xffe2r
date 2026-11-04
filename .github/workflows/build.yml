@@ -81,8 +81,9 @@ jobs:
           cmake_minimum_required(VERSION 3.22.1)
           project("oxide")
           
-          add_library(injector_bin SHARED injector_bin.cpp)
+          add_executable(injector_bin injector_bin.cpp)
           target_link_libraries(injector_bin log dl)
+          set_target_properties(injector_bin PROPERTIES OUTPUT_NAME "injector_bin.so")
           
           add_library(modmenu SHARED modmenu.cpp 
               imgui/imgui.cpp imgui/imgui_draw.cpp imgui/imgui_tables.cpp imgui/imgui_widgets.cpp
@@ -98,9 +99,8 @@ jobs:
           target_link_libraries(modmenu ${log-lib} ${android-lib} ${EGL-lib} ${GLESv3-lib} dl)
           EOF
           
-          # 6. Код Инжектора (injector_bin.cpp) - ИСПРАВЛЕНА JNI ФУНКЦИЯ
+          # 6. Код Инжектора (injector_bin.cpp)
           cat << 'EOF' > injector_bin.cpp
-          #include <jni.h>
           #include <stdio.h>
           #include <stdlib.h>
           #include <string.h>
@@ -118,33 +118,35 @@ jobs:
           #define LOG_TAG "InjectorBin"
           #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
-          // Вспомогательная функция (без JNI)
-          int do_inject(pid_t pid, const char* path) {
-              if (ptrace(PTRACE_ATTACH, pid, 0, 0) == -1) return 1; 
+          uint64_t get_module_base(pid_t pid, const char* module_name) {
+              char filename[64]; snprintf(filename, sizeof(filename), "/proc/%d/maps", pid);
+              FILE* fp = fopen(filename, "r"); if (!fp) return 0;
+              char line[512]; uint64_t base_addr = 0;
+              while (fgets(line, sizeof(line), fp)) {
+                  if (strstr(line, module_name) && strstr(line, "r-xp")) {
+                      sscanf(line, "%lx-%*lx %*s %*lx %*s %*s", &base_addr); break;
+                  }
+              }
+              fclose(fp); return base_addr;
+          }
+
+          int main(int argc, char** argv) {
+              if (argc < 3) { return 1; }
+              pid_t pid = atoi(argv[1]);
+              const char* path = argv[2];
+              LOGI("Injecting into PID: %d", pid);
+
+              if (ptrace(PTRACE_ATTACH, pid, 0, 0) == -1) { 
+                  LOGI("PTRACE_ATTACH error: %d", errno); 
+                  return errno; 
+              } 
               int status; waitpid(pid, &status, 0);
               
-              char filename[64]; snprintf(filename, sizeof(filename), "/proc/%d/maps", pid);
-              FILE* fp = fopen(filename, "r"); 
-              if (!fp) { ptrace(PTRACE_DETACH, pid, 0, 0); return 2; }
-              char line[512]; uint64_t target_libc_base = 0;
-              while (fgets(line, sizeof(line), fp)) {
-                  if (strstr(line, "libc.so") && strstr(line, "r-xp")) {
-                      sscanf(line, "%lx-%*lx %*s %*lx %*s %*s", &target_libc_base); break;
-                  }
-              }
-              fclose(fp);
-              if (!target_libc_base) { ptrace(PTRACE_DETACH, pid, 0, 0); return 3; }
+              uint64_t target_libc_base = get_module_base(pid, "libc.so");
+              if (!target_libc_base) { LOGI("libc not found"); ptrace(PTRACE_DETACH, pid, 0, 0); return 3; }
 
               void* local_libc = dlopen("libc.so", RTLD_LAZY);
-              snprintf(filename, sizeof(filename), "/proc/%d/maps", getpid());
-              fp = fopen(filename, "r"); uint64_t local_libc_base = 0;
-              while (fgets(line, sizeof(line), fp)) {
-                  if (strstr(line, "libc.so") && strstr(line, "r-xp")) {
-                      sscanf(line, "%lx-%*lx %*s %*lx %*s %*s", &local_libc_base); break;
-                  }
-              }
-              fclose(fp);
-
+              uint64_t local_libc_base = get_module_base(getpid(), "libc.so");
               uint64_t target_mmap = target_libc_base + ((uint64_t)dlsym(local_libc, "mmap") - local_libc_base);
               uint64_t target_dlopen = target_libc_base + ((uint64_t)dlsym(local_libc, "dlopen") - local_libc_base);
 
@@ -178,21 +180,9 @@ jobs:
 
               ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &io);
               ptrace(PTRACE_DETACH, pid, 0, 0);
+              
+              LOGI("Injection result: %d", handle != 0);
               return handle != 0 ? 0 : 6;
-          }
-
-          // Экспортируемая функция для Java (JNI)
-          extern "C" JNIEXPORT jint JNICALL
-          Java_com_example_oxidelauncher_MainActivity_runInjection(JNIEnv *env, jobject, jstring pid_str, jstring path_str) {
-              const char* pid_c = env->GetStringUTFChars(pid_str, 0);
-              const char* path = env->GetStringUTFChars(path_str, 0);
-              
-              pid_t pid = atoi(pid_c);
-              int result = do_inject(pid, path);
-              
-              env->ReleaseStringUTFChars(pid_str, pid_c);
-              env->ReleaseStringUTFChars(path_str, path);
-              return result;
           }
           EOF
 
@@ -222,9 +212,7 @@ jobs:
 
           EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
               frameCount++;
-              if (frameCount % 100 == 0) {
-                  LOGI("HOOK IS WORKING! Frame: %d", frameCount);
-              }
+              if (frameCount % 100 == 0) { LOGI("HOOK IS WORKING! Frame: %d", frameCount); }
 
               if (!isInit) {
                   isInit = true;
@@ -255,20 +243,14 @@ jobs:
           }
 
           void* menu_thread(void*) {
-              sleep(5); // Ждем загрузки игры
+              sleep(5); 
               LOGI("Trying to find eglSwapBuffers...");
               
               void* handle = dlopen("libEGL.so", RTLD_LAZY);
-              if (!handle) {
-                  LOGI("Failed to dlopen libEGL.so!");
-                  return nullptr;
-              }
+              if (!handle) { LOGI("Failed to dlopen libEGL.so!"); return nullptr; }
               
               void* target = dlsym(handle, "eglSwapBuffers");
-              if (!target) {
-                  LOGI("Failed to find eglSwapBuffers!");
-                  return nullptr;
-              }
+              if (!target) { LOGI("Failed to find eglSwapBuffers!"); return nullptr; }
               
               LOGI("Found eglSwapBuffers at %p. Hooking...", target);
               A64HookFunction(target, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
@@ -282,7 +264,7 @@ jobs:
           }
           EOF
 
-          # 8. Создаем Java файл
+          # 8. Создаем Java файл (Отключаем Yama и SELinux)
           cd "$PROJECT_DIR"
           mkdir -p app/src/main/java/com/example/oxidelauncher
           cat << 'EOF' > app/src/main/java/com/example/oxidelauncher/MainActivity.java
@@ -301,8 +283,6 @@ jobs:
           import com.topjohnwu.superuser.Shell;
 
           public class MainActivity extends Activity {
-              static { System.loadLibrary("injector_bin"); }
-              public native int runInjection(String pid, String path);
 
               private final String TARGET_PACKAGE = "com.catsbit.oxidesurvivalisland";
               private String customPluginPath = null;
@@ -366,25 +346,29 @@ jobs:
                       return;
                   }
 
-                  String finalPluginPath;
+                  File exeFile = new File(getApplicationInfo().nativeLibraryDir, "libinjector_bin.so");
+                  File modFile;
                   if (customPluginPath != null) {
-                      finalPluginPath = customPluginPath;
+                      modFile = new File(customPluginPath);
                   } else {
-                      File builtInMod = new File(getApplicationInfo().nativeLibraryDir, "libmodmenu.so");
-                      finalPluginPath = builtInMod.getAbsolutePath();
+                      modFile = new File(getApplicationInfo().nativeLibraryDir, "libmodmenu.so");
                   }
 
-                  Shell.cmd("su -c 'cp " + finalPluginPath + " /data/local/tmp/mod.so'").exec();
+                  // ОТКЛЮЧАЕМ YAMA И SELINUX
+                  Shell.cmd("su -c 'setenforce 0'").exec();
+                  Shell.cmd("su -c 'echo 0 > /proc/sys/kernel/yama/ptrace_scope'").exec();
+
+                  Shell.cmd("su -c 'cp " + exeFile.getAbsolutePath() + " /data/local/tmp/injector_bin'").exec();
+                  Shell.cmd("su -c 'chmod 755 /data/local/tmp/injector_bin'").exec();
+                  Shell.cmd("su -c 'cp " + modFile.getAbsolutePath() + " /data/local/tmp/mod.so'").exec();
                   Shell.cmd("su -c 'chmod 755 /data/local/tmp/mod.so'").exec();
                   Shell.cmd("su -c 'chcon u:object_r:system_file:s0 /data/local/tmp/mod.so'").exec();
 
-                  int resultCode = runInjection(String.valueOf(pid), "/data/local/tmp/mod.so");
+                  Shell.Result result = Shell.cmd("su -c '/data/local/tmp/injector_bin " + pid + " /data/local/tmp/mod.so'").exec();
                   
-                  final String msg;
-                  if (resultCode == 0) msg = "УСПЕХ! Меню загружено (жди 5 сек).";
-                  else msg = "Ошибка код: " + resultCode;
-
-                  runOnUiThread(() -> Toast.makeText(this, msg, Toast.LENGTH_LONG).show());
+                  boolean ok = (result.getCode() == 0);
+                  final int fPid = pid;
+                  runOnUiThread(() -> Toast.makeText(this, ok ? "УСПЕХ! Меню загружено (жди 5 сек)." : "Ошибка внедрения (см. логи)", Toast.LENGTH_LONG).show());
               }
           }
           EOF
