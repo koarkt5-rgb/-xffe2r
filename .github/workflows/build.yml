@@ -27,7 +27,7 @@ jobs:
         run: |
           sdkmanager "ndk;27.0.12077973" "cmake;3.22.1"
 
-      - name: Prepare Source Code
+      - name: Extract and Prepare
         run: |
           mkdir -p build_dir
           if ls *.zip 1> /dev/null 2>&1; then
@@ -38,312 +38,33 @@ jobs:
           else
             cp -r . build_dir/
           fi
-
-      - name: Generate C++ Files and Build
-        run: |
+          
           SETTINGS_FILE=$(find build_dir -name "settings.gradle" | head -n 1)
           PROJECT_DIR=$(dirname "$SETTINGS_FILE")
-          cd "$PROJECT_DIR"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
           
-          # 1. Перезаписываем settings.gradle
+          cd "$PROJECT_DIR"
+          # Исправляем settings.gradle
           cat << 'EOF' > settings.gradle
           pluginManagement {
-              repositories {
-                  google()
-                  mavenCentral()
-                  gradlePluginPortal()
-              }
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
           }
           dependencyResolutionManagement {
               repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
-              repositories {
-                  google()
-                  mavenCentral()
-                  maven { url 'https://jitpack.io' }
-              }
+              repositories { google(); mavenCentral(); maven { url 'https://jitpack.io' } }
           }
           rootProject.name = "OxideLauncher"
           include ':app'
           EOF
-          
-          # 2. Создаем папку для C++ и файл CMakeLists.txt
+
+          # Копируем наши C++ файлы в проект
           mkdir -p app/src/main/cpp
-          cat << 'EOF' > app/src/main/cpp/CMakeLists.txt
-          cmake_minimum_required(VERSION 3.22.1)
-          project("injector")
-          add_library(injector SHARED native-lib.cpp)
-          find_library(log-lib log)
-          find_library(dl-lib dl)
-          target_link_libraries(injector ${log-lib} ${dl-lib})
-          EOF
-          
-          # 3. Создаем код инжектора native-lib.cpp
-          cat << 'EOF' > app/src/main/cpp/native-lib.cpp
-          #include <jni.h>
-          #include <stdio.h>
-          #include <stdlib.h>
-          #include <string.h>
-          #include <unistd.h>
-          #include <sys/ptrace.h>
-          #include <sys/wait.h>
-          #include <sys/mman.h>
-          #include <sys/uio.h>
-          #include <dlfcn.h>
+          cp $GITHUB_WORKSPACE/native-lib.cpp app/src/main/cpp/
+          cp $GITHUB_WORKSPACE/CMakeLists.txt app/src/main/cpp/
 
-          struct user_pt_regs {
-              __u64 regs[31];
-              __u64 sp;
-              __u64 pc;
-              __u64 pstate;
-          };
-
-          uint64_t get_module_base(pid_t pid, const char* module_name) {
-              char filename[64];
-              snprintf(filename, sizeof(filename), "/proc/%d/maps", pid);
-              FILE* fp = fopen(filename, "r");
-              if (!fp) return 0;
-              char line[512];
-              uint64_t base_addr = 0;
-              while (fgets(line, sizeof(line), fp)) {
-                  if (strstr(line, module_name) && strstr(line, "r-xp")) {
-                      sscanf(line, "%lx-%*lx %*s %*lx %*s %*s", &base_addr);
-                      break;
-                  }
-              }
-              fclose(fp);
-              return base_addr;
-          }
-
-          uint64_t remote_call(pid_t pid, uint64_t func_addr, uint64_t* args, int arg_count) {
-              struct user_pt_regs regs;
-              struct iovec io = { .iov_base = &regs, .iov_len = sizeof(regs) };
-              if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &io) == -1) return 0;
-              struct user_pt_regs saved_regs = regs;
-              for (int i = 0; i < arg_count && i < 8; i++) regs.regs[i] = args[i];
-              regs.pc = func_addr;
-              if (ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &io) == -1) return 0;
-              ptrace(PTRACE_CONT, pid, 0, 0);
-              int status;
-              waitpid(pid, &status, 0);
-              ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &io);
-              uint64_t ret_val = regs.regs[0];
-              struct iovec io_saved = { .iov_base = &saved_regs, .iov_len = sizeof(saved_regs) };
-              ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &io_saved);
-              return ret_val;
-          }
-
-          extern "C" JNIEXPORT jboolean JNICALL
-          Java_com_example_oxidelauncher_MainActivity_injectLibrary(JNIEnv *env, jobject, jint pid, jstring lib_path) {
-              const char* path = env->GetStringUTFChars(lib_path, 0);
-              if (ptrace(PTRACE_ATTACH, pid, 0, 0) == -1) {
-                  env->ReleaseStringUTFChars(lib_path, path);
-                  return JNI_FALSE;
-              }
-              int status;
-              waitpid(pid, &status, 0);
-              uint64_t target_libc_base = get_module_base(pid, "libc.so");
-              if (!target_libc_base) {
-                  ptrace(PTRACE_DETACH, pid, 0, 0);
-                  env->ReleaseStringUTFChars(lib_path, path);
-                  return JNI_FALSE;
-              }
-              void* local_libc = dlopen("libc.so", RTLD_LAZY);
-              uint64_t local_mmap = (uint64_t)dlsym(local_libc, "mmap");
-              uint64_t local_dlopen = (uint64_t)dlsym(local_libc, "dlopen");
-              uint64_t local_libc_base = get_module_base(getpid(), "libc.so");
-              uint64_t target_mmap = target_libc_base + (local_mmap - local_libc_base);
-              uint64_t target_dlopen = target_libc_base + (local_dlopen - local_libc_base);
-              uint64_t mmap_args[] = {0, 256, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, (uint64_t)-1, 0};
-              uint64_t remote_mem = remote_call(pid, target_mmap, mmap_args, 6);
-              struct iovec local_iov = { .iov_base = (void*)path, .iov_len = strlen(path) + 1 };
-              struct iovec remote_iov = { .iov_base = (void*)remote_mem, .iov_len = strlen(path) + 1 };
-              process_vm_writev(pid, &local_iov, 1, &remote_iov, 1, 0);
-              uint64_t dlopen_args[] = {remote_mem, RTLD_NOW};
-              uint64_t handle = remote_call(pid, target_dlopen, dlopen_args, 2);
-              ptrace(PTRACE_DETACH, pid, 0, 0);
-              env->ReleaseStringUTFChars(lib_path, path);
-              return handle != 0 ? JNI_TRUE : JNI_FALSE;
-          }
-          EOF
-          
-          # 4. Запускаем сборку
-          if [ ! -f "gradlew" ]; then gradle wrapper; fi
-          chmod +x gradlew
-          ./gradlew assembleDebug
-
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: Launcher-APK
-          path: '**/app/build/outputs/apk/debug/app-debug.apk'name: Build APK
-
-on:
-  push:
-    branches: [ "main" ]
-  workflow_dispatch:
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '17'
-
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v4
-        with:
-          packages: 'platform-tools'
-
-      - name: Install NDK and CMake
+      - name: Build APK
         run: |
-          sdkmanager "ndk;27.0.12077973" "cmake;3.22.1"
-
-      - name: Prepare Source Code
-        run: |
-          mkdir -p build_dir
-          if ls *.zip 1> /dev/null 2>&1; then
-            unzip -o *.zip -d build_dir
-          elif ls *.7z 1> /dev/null 2>&1; then
-            sudo apt-get update && sudo apt-get install -y p7zip-full
-            7z x *.7z -obuild_dir
-          else
-            cp -r . build_dir/
-          fi
-
-      - name: Generate C++ Files and Build
-        run: |
-          SETTINGS_FILE=$(find build_dir -name "settings.gradle" | head -n 1)
-          PROJECT_DIR=$(dirname "$SETTINGS_FILE")
-          cd "$PROJECT_DIR"
-          
-          # 1. Перезаписываем settings.gradle
-          cat << 'EOF' > settings.gradle
-          pluginManagement {
-              repositories {
-                  google()
-                  mavenCentral()
-                  gradlePluginPortal()
-              }
-          }
-          dependencyResolutionManagement {
-              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
-              repositories {
-                  google()
-                  mavenCentral()
-                  maven { url 'https://jitpack.io' }
-              }
-          }
-          rootProject.name = "OxideLauncher"
-          include ':app'
-          EOF
-          
-          # 2. Создаем папку для C++ и файл CMakeLists.txt
-          mkdir -p app/src/main/cpp
-          cat << 'EOF' > app/src/main/cpp/CMakeLists.txt
-          cmake_minimum_required(VERSION 3.22.1)
-          project("injector")
-          add_library(injector SHARED native-lib.cpp)
-          find_library(log-lib log)
-          find_library(dl-lib dl)
-          target_link_libraries(injector ${log-lib} ${dl-lib})
-          EOF
-          
-          # 3. Создаем код инжектора native-lib.cpp
-          cat << 'EOF' > app/src/main/cpp/native-lib.cpp
-          #include <jni.h>
-          #include <stdio.h>
-          #include <stdlib.h>
-          #include <string.h>
-          #include <unistd.h>
-          #include <sys/ptrace.h>
-          #include <sys/wait.h>
-          #include <sys/mman.h>
-          #include <sys/uio.h>
-          #include <dlfcn.h>
-
-          struct user_pt_regs {
-              __u64 regs[31];
-              __u64 sp;
-              __u64 pc;
-              __u64 pstate;
-          };
-
-          uint64_t get_module_base(pid_t pid, const char* module_name) {
-              char filename[64];
-              snprintf(filename, sizeof(filename), "/proc/%d/maps", pid);
-              FILE* fp = fopen(filename, "r");
-              if (!fp) return 0;
-              char line[512];
-              uint64_t base_addr = 0;
-              while (fgets(line, sizeof(line), fp)) {
-                  if (strstr(line, module_name) && strstr(line, "r-xp")) {
-                      sscanf(line, "%lx-%*lx %*s %*lx %*s %*s", &base_addr);
-                      break;
-                  }
-              }
-              fclose(fp);
-              return base_addr;
-          }
-
-          uint64_t remote_call(pid_t pid, uint64_t func_addr, uint64_t* args, int arg_count) {
-              struct user_pt_regs regs;
-              struct iovec io = { .iov_base = &regs, .iov_len = sizeof(regs) };
-              if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &io) == -1) return 0;
-              struct user_pt_regs saved_regs = regs;
-              for (int i = 0; i < arg_count && i < 8; i++) regs.regs[i] = args[i];
-              regs.pc = func_addr;
-              if (ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &io) == -1) return 0;
-              ptrace(PTRACE_CONT, pid, 0, 0);
-              int status;
-              waitpid(pid, &status, 0);
-              ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &io);
-              uint64_t ret_val = regs.regs[0];
-              struct iovec io_saved = { .iov_base = &saved_regs, .iov_len = sizeof(saved_regs) };
-              ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &io_saved);
-              return ret_val;
-          }
-
-          extern "C" JNIEXPORT jboolean JNICALL
-          Java_com_example_oxidelauncher_MainActivity_injectLibrary(JNIEnv *env, jobject, jint pid, jstring lib_path) {
-              const char* path = env->GetStringUTFChars(lib_path, 0);
-              if (ptrace(PTRACE_ATTACH, pid, 0, 0) == -1) {
-                  env->ReleaseStringUTFChars(lib_path, path);
-                  return JNI_FALSE;
-              }
-              int status;
-              waitpid(pid, &status, 0);
-              uint64_t target_libc_base = get_module_base(pid, "libc.so");
-              if (!target_libc_base) {
-                  ptrace(PTRACE_DETACH, pid, 0, 0);
-                  env->ReleaseStringUTFChars(lib_path, path);
-                  return JNI_FALSE;
-              }
-              void* local_libc = dlopen("libc.so", RTLD_LAZY);
-              uint64_t local_mmap = (uint64_t)dlsym(local_libc, "mmap");
-              uint64_t local_dlopen = (uint64_t)dlsym(local_libc, "dlopen");
-              uint64_t local_libc_base = get_module_base(getpid(), "libc.so");
-              uint64_t target_mmap = target_libc_base + (local_mmap - local_libc_base);
-              uint64_t target_dlopen = target_libc_base + (local_dlopen - local_libc_base);
-              uint64_t mmap_args[] = {0, 256, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, (uint64_t)-1, 0};
-              uint64_t remote_mem = remote_call(pid, target_mmap, mmap_args, 6);
-              struct iovec local_iov = { .iov_base = (void*)path, .iov_len = strlen(path) + 1 };
-              struct iovec remote_iov = { .iov_base = (void*)remote_mem, .iov_len = strlen(path) + 1 };
-              process_vm_writev(pid, &local_iov, 1, &remote_iov, 1, 0);
-              uint64_t dlopen_args[] = {remote_mem, RTLD_NOW};
-              uint64_t handle = remote_call(pid, target_dlopen, dlopen_args, 2);
-              ptrace(PTRACE_DETACH, pid, 0, 0);
-              env->ReleaseStringUTFChars(lib_path, path);
-              return handle != 0 ? JNI_TRUE : JNI_FALSE;
-          }
-          EOF
-          
-          # 4. Запускаем сборку
+          cd $PROJECT_DIR
           if [ ! -f "gradlew" ]; then gradle wrapper; fi
           chmod +x gradlew
           ./gradlew assembleDebug
