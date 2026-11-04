@@ -18,43 +18,55 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      # 1. Обновленный экшен + явное указание пакетов (без legacy tools)
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
         with:
           packages: 'platform-tools'
 
-      # 2. Устанавливаем NDK и CMake, которые нужны для сборки C++
       - name: Install NDK and CMake
         run: |
           sdkmanager "ndk;27.0.12077973" "cmake;3.22.1"
 
-      # 3. Распаковка архива (если он есть)
-      - name: Unzip if needed
+      - name: Prepare Source Code
         run: |
+          mkdir -p build_dir
           if ls *.zip 1> /dev/null 2>&1; then
-            unzip -o *.zip -d project
-            cd project
-            if [ -d "OxideLauncher" ]; then cd OxideLauncher; fi
+            unzip -o *.zip -d build_dir
+          elif ls *.7z 1> /dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y p7zip-full
+            7z x *.7z -obuild_dir
           else
-            mkdir project
-            cp -r * project/ || true
-            cd project
+            cp -r . build_dir/
           fi
 
-      # 4. Сборка APK
-      - name: Build APK
+      - name: Find Gradle Project and Build APK
         run: |
-          cd project
+          # Ищем файл settings.gradle по всем папкам
+          SETTINGS_FILE=$(find build_dir -name "settings.gradle" | head -n 1)
+          
+          if [ -z "$SETTINGS_FILE" ]; then
+            echo "ОШИБКА: Файл settings.gradle не найден вообще!"
+            exit 1
+          fi
+          
+          # Получаем путь к папке, где лежит проект
+          PROJECT_DIR=$(dirname "$SETTINGS_FILE")
+          echo "Найдена папка с проектом: $PROJECT_DIR"
+          
+          # Переходим туда и собираем
+          cd "$PROJECT_DIR"
+          
           if [ ! -f "gradlew" ]; then
+            echo "Генерируем gradlew..."
             gradle wrapper
           fi
+          
           chmod +x gradlew
           ./gradlew assembleDebug
 
-      # 5. Загрузка готового APK
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: Launcher-APK
-          path: project/app/build/outputs/apk/debug/app-debug.apk
+          # Ищем готовый APK во всех папках
+          path: '**/app/build/outputs/apk/debug/app-debug.apk'
