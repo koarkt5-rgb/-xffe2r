@@ -29,7 +29,7 @@ jobs:
 
       - name: Build Everything Automatically
         run: |
-          # 1. Распаковка архива с дизайном
+          # 1. Распаковка архива
           mkdir -p build_dir
           if ls *.zip 1> /dev/null 2>&1; then unzip -o *.zip -d build_dir
           elif ls *.7z 1> /dev/null 2>&1; then sudo apt-get update && sudo apt-get install -y p7zip-full; 7z x *.7z -obuild_dir
@@ -39,7 +39,7 @@ jobs:
           PROJECT_DIR=$(realpath $(dirname "$SETTINGS_FILE"))
           cd "$PROJECT_DIR"
           
-          # 2. Настройка Gradle
+          # 2. settings.gradle
           cat << 'EOF' > settings.gradle
           pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
           dependencyResolutionManagement {
@@ -50,6 +50,7 @@ jobs:
           include ':app'
           EOF
           
+          # 3. app/build.gradle
           cat << 'EOF' > app/build.gradle
           plugins { id 'com.android.application' }
           android {
@@ -70,12 +71,12 @@ jobs:
           dependencies { implementation 'com.github.topjohnwu.libsu:core:5.2.2' }
           EOF
           
-          # 3. Клонирование ImGui и хуков
+          # 4. Клонируем ImGui и Dobby
           cd app/src/main/cpp
           git clone --depth 1 https://github.com/ocornut/imgui.git
-          git clone --depth 1 https://github.com/Rprop/And64InlineHook.git
+          git clone --depth 1 https://github.com/jmpews/Dobby.git
           
-          # 4. Настройка CMake
+          # 5. Создаем CMakeLists.txt (с Dobby и Vulkan)
           cat << 'EOF' > CMakeLists.txt
           cmake_minimum_required(VERSION 3.22.1)
           project("oxide")
@@ -86,19 +87,28 @@ jobs:
           
           add_library(modmenu SHARED modmenu.cpp 
               imgui/imgui.cpp imgui/imgui_draw.cpp imgui/imgui_tables.cpp imgui/imgui_widgets.cpp
-              imgui/backends/imgui_impl_opengl3.cpp imgui/backends/imgui_impl_android.cpp
-              And64InlineHook/And64InlineHook.cpp
+              imgui/backends/imgui_impl_vulkan.cpp imgui/backends/imgui_impl_android.cpp
+              Dobby/source/Backend/UserMode/UserMode.cpp
+              Dobby/source/Backend/UserMode/PlatformUtil/ProcessRuntime.cpp
+              Dobby/source/Backend/UserMode/PlatformUtil/Posix/ProcessRuntime.cpp
+              Dobby/source/Backend/UserMode/PlatformUtil/Posix/MemoryOperation.cpp
+              Dobby/source/Backend/UserMode/PlatformUtil/Posix/ThreadOperation.cpp
+              Dobby/source/Backend/UserMode/PlatformUtil/Posix/FileOperation.cpp
+              Dobby/source/Backend/UserMode/PlatformUtil/Posix/SymbolOperation.cpp
+              Dobby/source/Backend/UserMode/PlatformUtil/Posix/SignalOperation.cpp
+              Dobby/source/Intercept/InlineHook/InlineHook.cpp
+              Dobby/source/Intercept/InlineHook/ARM64/InlineHook.cpp
+              Dobby/source/Trampoline/ARM64/Trampoline.cpp
           )
-          target_include_directories(modmenu PRIVATE imgui And64InlineHook)
+          target_include_directories(modmenu PRIVATE imgui Dobby/include)
           
           find_library(log-lib log)
           find_library(android-lib android)
-          find_library(EGL-lib EGL)
-          find_library(GLESv3-lib GLESv3)
-          target_link_libraries(modmenu ${log-lib} ${android-lib} ${EGL-lib} ${GLESv3-lib} dl)
+          find_library(vulkan-lib vulkan)
+          target_link_libraries(modmenu ${log-lib} ${android-lib} ${vulkan-lib} dl)
           EOF
           
-          # 5. Код Инжектора (C++)
+          # 6. Код Инжектора (injector_bin.cpp)
           cat << 'EOF' > injector_bin.cpp
           #include <stdio.h>
           #include <stdlib.h>
@@ -175,63 +185,83 @@ jobs:
           }
           EOF
 
-          # 6. Код Меню ImGui (C++)
+          # 7. Код Меню ImGui (Vulkan + Dobby)
           cat << 'EOF' > modmenu.cpp
           #include <jni.h>
           #include <android/log.h>
           #include <pthread.h>
           #include <unistd.h>
-          #include <EGL/egl.h>
-          #include <GLES3/gl3.h>
+          #include <vulkan/vulkan.h>
           #include <dlfcn.h>
           #include "imgui/imgui.h"
-          #include "imgui/backends/imgui_impl_opengl3.h"
+          #include "imgui/backends/imgui_impl_vulkan.h"
           #include "imgui/backends/imgui_impl_android.h"
-          #include "And64InlineHook/And64InlineHook.hpp"
+          #include "Dobby/dobby.h"
 
           #define LOG_TAG "OxideCheat"
           #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
           bool isInit = false;
-          EGLBoolean (*orig_eglSwapBuffers)(EGLDisplay dpy, EGLSurface surface) = nullptr;
+          VkQueue g_Queue = VK_NULL_HANDLE;
+          VkRenderPass g_RenderPass = VK_NULL_HANDLE;
+          VkCommandBuffer g_CommandBuffer = VK_NULL_HANDLE;
+          VkCommandPool g_CommandPool = VK_NULL_HANDLE;
 
-          EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
+          VkResult (*orig_vkQueuePresentKHR)(VkQueue, const VkPresentInfoKHR*) = nullptr;
+
+          VkResult hook_vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo) {
               if (!isInit) {
                   isInit = true;
+                  g_Queue = queue;
+                  LOGI("vkQueuePresentKHR hooked, initializing ImGui...");
+                  // Инициализация ImGui для Vulkan здесь (требует создания render pass и т.д.)
+                  // Это упрощенный пример. В реальном проекте нужно создать все Vulkan ресурсы.
                   IMGUI_CHECKVERSION();
                   ImGui::CreateContext();
                   ImGuiIO& io = ImGui::GetIO();
-                  io.DisplaySize = ImVec2((float)1080, (float)2400);
                   ImGui::StyleColorsDark();
-                  ImGui_ImplOpenGL3_Init("#version 300 es");
                   ImGui_ImplAndroid_Init(nullptr);
+                  // ImGui_ImplVulkan_Init(...) требует render pass, который мы пока не создаем.
+                  // Для простоты мы пропустим полную инициализацию Vulkan, чтобы просто проверить хук.
+                  // В следующем шаге мы добавим полноценную инициализацию.
               }
-              ImGui_ImplOpenGL3_NewFrame();
-              ImGui_ImplAndroid_NewFrame();
-              ImGui::NewFrame();
-              ImGui::Begin("ROCKET CHEAT");
-              ImGui::Text("Inject Works!");
-              ImGui::End();
-              ImGui::Render();
-              ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-              return orig_eglSwapBuffers(dpy, surface);
+              
+              // Здесь должен быть код отрисовки ImGui через Vulkan
+              // ImGui_ImplVulkan_NewFrame();
+              // ImGui_ImplAndroid_NewFrame();
+              // ImGui::NewFrame();
+              // ImGui::Begin("ROCKET CHEAT");
+              // ImGui::Text("Vulkan Hook Works!");
+              // ImGui::End();
+              // ImGui::Render();
+              // ... запись команд в command buffer и вызов vkQueueSubmit ...
+
+              return orig_vkQueuePresentKHR(queue, pPresentInfo);
           }
 
           void* menu_thread(void*) {
               sleep(5); 
-              void* handle = dlopen("libEGL.so", RTLD_LAZY);
-              if (!handle) return nullptr;
-              void* target = dlsym(handle, "eglSwapBuffers");
-              if (!target) return nullptr;
-              A64HookFunction(target, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
+              LOGI("Trying to find vkQueuePresentKHR...");
+              
+              void* handle = dlopen("libvulkan.so", RTLD_LAZY);
+              if (!handle) { LOGI("Failed to dlopen libvulkan.so!"); return nullptr; }
+              
+              void* target = dlsym(handle, "vkQueuePresentKHR");
+              if (!target) { LOGI("Failed to find vkQueuePresentKHR!"); return nullptr; }
+              
+              LOGI("Found vkQueuePresentKHR at %p. Hooking with Dobby...", target);
+              DobbyHook(target, (void*)hook_vkQueuePresentKHR, (void**)&orig_vkQueuePresentKHR);
+              LOGI("Hook installation finished!");
               return nullptr;
           }
+
           __attribute__((constructor)) void init() {
+              LOGI("Library loaded in game!");
               pthread_t t; pthread_create(&t, nullptr, menu_thread, nullptr);
           }
           EOF
 
-          # 7. Код Java (MainActivity) с обходом 127 ошибки
+          # 8. Создаем Java файл (MainActivity.java) с обходом DEFEX
           cd "$PROJECT_DIR"
           mkdir -p app/src/main/java/com/example/oxidelauncher
           cat << 'EOF' > app/src/main/java/com/example/oxidelauncher/MainActivity.java
@@ -311,7 +341,7 @@ jobs:
                   File exeFile = new File(getApplicationInfo().nativeLibraryDir, "injector_bin.so");
                   File modFile = (customPluginPath != null) ? new File(customPluginPath) : new File(getApplicationInfo().nativeLibraryDir, "libmodmenu.so");
 
-                  // ОБХОД SAMSUNG DEFEX (bind-mount logcat)
+                  // Обход Samsung DEFEX (bind-mount logcat)
                   String cmd = "su -c '"
                       + "setenforce 0; "
                       + "echo 0 > /proc/sys/kernel/yama/ptrace_scope; "
@@ -334,7 +364,7 @@ jobs:
           }
           EOF
 
-          # 8. Запуск сборки
+          # 9. Запуск сборки
           cd "$PROJECT_DIR"
           if [ ! -f "gradlew" ]; then gradle wrapper; fi
           chmod +x gradlew
