@@ -29,6 +29,7 @@ jobs:
 
       - name: Build Everything Automatically
         run: |
+          # 1. Распаковка архива
           mkdir -p build_dir
           if ls *.zip 1> /dev/null 2>&1; then unzip -o *.zip -d build_dir
           elif ls *.7z 1> /dev/null 2>&1; then sudo apt-get update && sudo apt-get install -y p7zip-full; 7z x *.7z -obuild_dir
@@ -38,6 +39,7 @@ jobs:
           PROJECT_DIR=$(realpath $(dirname "$SETTINGS_FILE"))
           cd "$PROJECT_DIR"
           
+          # 2. settings.gradle
           cat << 'EOF' > settings.gradle
           pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
           dependencyResolutionManagement {
@@ -48,6 +50,7 @@ jobs:
           include ':app'
           EOF
           
+          # 3. app/build.gradle
           cat << 'EOF' > app/build.gradle
           plugins { id 'com.android.application' }
           android {
@@ -68,10 +71,12 @@ jobs:
           dependencies { implementation 'com.github.topjohnwu.libsu:core:5.2.2' }
           EOF
           
+          # 4. Клонируем ImGui и библиотеку хуков
           cd app/src/main/cpp
           git clone --depth 1 https://github.com/ocornut/imgui.git
           git clone --depth 1 https://github.com/Rprop/And64InlineHook.git
           
+          # 5. Создаем CMakeLists.txt
           cat << 'EOF' > CMakeLists.txt
           cmake_minimum_required(VERSION 3.22.1)
           project("oxide")
@@ -94,6 +99,7 @@ jobs:
           target_link_libraries(modmenu ${log-lib} ${android-lib} ${EGL-lib} ${GLESv3-lib} dl)
           EOF
           
+          # 6. Код Инжектора (injector_bin.cpp)
           cat << 'EOF' > injector_bin.cpp
           #include <stdio.h>
           #include <stdlib.h>
@@ -172,6 +178,7 @@ jobs:
           }
           EOF
 
+          # 7. Код Меню (modmenu.cpp)
           cat << 'EOF' > modmenu.cpp
           #include <jni.h>
           #include <android/log.h>
@@ -204,7 +211,6 @@ jobs:
                   ImGui::StyleColorsDark();
                   ImGui_ImplOpenGL3_Init("#version 300 es");
                   ImGui_ImplAndroid_Init(nullptr);
-                  LOGI("ImGui Initialized!");
               }
               ImGui_ImplOpenGL3_NewFrame();
               ImGui_ImplAndroid_NewFrame();
@@ -231,6 +237,7 @@ jobs:
           }
           EOF
 
+          # 8. Создаем Java файл (Исправлены имена файлов и цепочка команд)
           cd "$PROJECT_DIR"
           mkdir -p app/src/main/java/com/example/oxidelauncher
           cat << 'EOF' > app/src/main/java/com/example/oxidelauncher/MainActivity.java
@@ -307,19 +314,24 @@ jobs:
                       return;
                   }
 
-                  File exeFile = new File(getApplicationInfo().nativeLibraryDir, "libinjector_bin.so");
+                  // ИСПРАВЛЕНИЕ 1: Ищем injector_bin.so, а не libinjector_bin.so
+                  File exeFile = new File(getApplicationInfo().nativeLibraryDir, "injector_bin.so");
                   File modFile = (customPluginPath != null) ? new File(customPluginPath) : new File(getApplicationInfo().nativeLibraryDir, "libmodmenu.so");
 
-                  Shell.cmd("su -c 'setenforce 0'").exec();
-                  Shell.cmd("su -c 'echo 0 > /proc/sys/kernel/yama/ptrace_scope'").exec();
-                  Shell.cmd("su -c 'cp " + exeFile.getAbsolutePath() + " /data/local/tmp/injector_bin'").exec();
-                  Shell.cmd("su -c 'chmod 755 /data/local/tmp/injector_bin'").exec();
-                  Shell.cmd("su -c 'cp " + modFile.getAbsolutePath() + " /data/local/tmp/mod.so'").exec();
-                  Shell.cmd("su -c 'chmod 755 /data/local/tmp/mod.so'").exec();
-                  Shell.cmd("su -c 'chcon u:object_r:system_file:s0 /data/local/tmp/mod.so'").exec();
+                  // ИСПРАВЛЕНИЕ 2: Используем точку с запятой (;), чтобы chcon не ломал запуск
+                  String cmd = "su -c '"
+                      + "setenforce 0; "
+                      + "echo 0 > /proc/sys/kernel/yama/ptrace_scope; "
+                      + "cp \"" + exeFile.getAbsolutePath() + "\" /data/local/tmp/injector_bin; "
+                      + "chmod 755 /data/local/tmp/injector_bin; "
+                      + "chcon u:object_r:system_file:s0 /data/local/tmp/injector_bin; "
+                      + "cp \"" + modFile.getAbsolutePath() + "\" /data/local/tmp/mod.so; "
+                      + "chmod 755 /data/local/tmp/mod.so; "
+                      + "chcon u:object_r:system_file:s0 /data/local/tmp/mod.so; "
+                      + "/data/local/tmp/injector_bin " + pid + " /data/local/tmp/mod.so"
+                      + "'";
 
-                  // ПОЛУЧАЕМ РЕАЛЬНЫЙ КОД ОШИБКИ ОТ ИНЖЕКТОРА
-                  Shell.Result result = Shell.cmd("su -c '/data/local/tmp/injector_bin " + pid + " /data/local/tmp/mod.so'").exec();
+                  Shell.Result result = Shell.cmd(cmd).exec();
                   int code = result.getCode();
                   
                   runOnUiThread(() -> Toast.makeText(this, "Код: " + code, Toast.LENGTH_LONG).show());
@@ -327,6 +339,7 @@ jobs:
           }
           EOF
 
+          # 9. Запуск сборки
           cd "$PROJECT_DIR"
           if [ ! -f "gradlew" ]; then gradle wrapper; fi
           chmod +x gradlew
