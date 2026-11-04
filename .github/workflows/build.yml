@@ -50,7 +50,7 @@ jobs:
           include ':app'
           EOF
           
-          # 3. Перезаписываем app/build.gradle (ДОБАВЛЕН abiFilters ТОЛЬКО ДЛЯ 64-БИТ)
+          # 3. Перезаписываем app/build.gradle
           cat << 'EOF' > app/build.gradle
           plugins { id 'com.android.application' }
           android {
@@ -63,9 +63,7 @@ jobs:
                   targetSdk 34
                   versionCode 1
                   versionName "1.0"
-                  ndk {
-                      abiFilters 'arm64-v8a' // Собираем только под 64-бит
-                  }
+                  ndk { abiFilters 'arm64-v8a' }
               }
               externalNativeBuild { cmake { path "src/main/cpp/CMakeLists.txt"; version "3.22.1" } }
               compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
@@ -73,17 +71,33 @@ jobs:
           dependencies { implementation 'com.github.topjohnwu.libsu:core:5.2.2' }
           EOF
           
-          # 4. Создаем C++ файлы
-          mkdir -p app/src/main/cpp
-          cat << 'EOF' > app/src/main/cpp/CMakeLists.txt
+          # 4. Клонируем ImGui с GitHub (чтобы тебе не загружать архивы вручную)
+          cd app/src/main/cpp
+          git clone --depth 1 https://github.com/ocornut/imgui.git
+          
+          # 5. Создаем CMakeLists.txt
+          cat << 'EOF' > CMakeLists.txt
           cmake_minimum_required(VERSION 3.22.1)
-          project("injector")
-          add_library(injector SHARED native-lib.cpp)
+          project("oxide")
+          
+          # 1. Инжектор
+          add_library(injector SHARED injector.cpp)
+          target_link_libraries(injector log dl)
+          
+          # 2. Меню (ImGui)
+          add_library(modmenu SHARED modmenu.cpp 
+              imgui/imgui.cpp imgui/imgui_draw.cpp imgui/imgui_tables.cpp imgui/imgui_widgets.cpp
+              imgui/backends/imgui_impl_opengl3.cpp imgui/backends/imgui_impl_android.cpp
+          )
           find_library(log-lib log)
-          target_link_libraries(injector ${log-lib} dl)
+          find_library(android-lib android)
+          find_library(EGL-lib EGL)
+          find_library(GLESv3-lib GLESv3)
+          target_link_libraries(modmenu ${log-lib} ${android-lib} ${EGL-lib} ${GLESv3-lib} dl)
           EOF
           
-          cat << 'EOF' > app/src/main/cpp/native-lib.cpp
+          # 6. Код Инжектора (injector.cpp)
+          cat << 'EOF' > injector.cpp
           #include <jni.h>
           #include <stdio.h>
           #include <stdlib.h>
@@ -149,20 +163,49 @@ jobs:
           }
           EOF
 
-          # 5. Создаем Java файл
+          # 7. Код Меню (modmenu.cpp)
+          cat << 'EOF' > modmenu.cpp
+          #include <jni.h>
+          #include <android/log.h>
+          #include <pthread.h>
+          #include <unistd.h>
+          #include "imgui/imgui.h"
+          
+          #define LOG_TAG "OxideCheat"
+          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+          
+          bool aimbot = false;
+          bool esp = false;
+          
+          void* menu_thread(void*) {
+              sleep(5);
+              LOGI("MENU LOADED! ImGui Ready.");
+              // В реальном чите здесь будет хук на отрисовку OpenGL
+              while(true) {
+                  if(aimbot) { /* Логика аима */ }
+                  if(esp) { /* Логика есп */ }
+                  sleep(1);
+              }
+              return nullptr;
+          }
+          
+          __attribute__((constructor))
+          void init() {
+              pthread_t t;
+              pthread_create(&t, nullptr, menu_thread, nullptr);
+          }
+          EOF
+
+          # 8. Создаем Java файл (MainActivity.java)
           mkdir -p app/src/main/java/com/example/oxidelauncher
           cat << 'EOF' > app/src/main/java/com/example/oxidelauncher/MainActivity.java
           package com.example.oxidelauncher;
 
           import android.app.Activity;
-          import android.content.Intent;
-          import android.net.Uri;
           import android.os.Bundle;
           import android.widget.TextView;
           import android.widget.Toast;
           import java.io.File;
-          import java.io.FileOutputStream;
-          import java.io.InputStream;
           import java.util.List;
           import com.topjohnwu.superuser.Shell;
 
@@ -170,7 +213,6 @@ jobs:
               static { System.loadLibrary("injector"); }
               public native boolean injectLibrary(int pid, String libPath);
 
-              private String pluginPath = null;
               private final String TARGET_PACKAGE = "com.catsbit.oxidesurvivalisland";
 
               @Override
@@ -178,48 +220,20 @@ jobs:
                   super.onCreate(savedInstanceState);
                   setContentView(R.layout.activity_main);
 
-                  TextView btnAddPlugin = findViewById(R.id.btnAddPlugin);
                   TextView btnLaunch = findViewById(R.id.btnLaunch);
+                  // Скрываем кнопку плагина, так как он теперь вшит в APK
+                  findViewById(R.id.btnAddPlugin).setVisibility(TextView.GONE); 
 
                   Shell.getShell(shell -> {
                       if (!shell.isRoot()) runOnUiThread(() -> Toast.makeText(this, "НЕТ ROOT!", Toast.LENGTH_LONG).show());
                   });
 
-                  btnAddPlugin.setOnClickListener(v -> {
-                      Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-                      i.setType("*/*");
-                      startActivityForResult(i, 100);
-                  });
-
                   btnLaunch.setOnClickListener(v -> {
-                      if (pluginPath == null) {
-                          Toast.makeText(this, "Выбери .so файл!", Toast.LENGTH_SHORT).show();
-                          return;
-                      }
-                      new Thread(() -> doInject(TARGET_PACKAGE, pluginPath)).start();
+                      new Thread(() -> doInject(TARGET_PACKAGE)).start();
                   });
               }
 
-              @Override
-              protected void onActivityResult(int req, int res, Intent data) {
-                  super.onActivityResult(req, res, data);
-                  if (req == 100 && res == RESULT_OK && data != null) {
-                      try {
-                          InputStream in = getContentResolver().openInputStream(data.getData());
-                          File out = new File(getCacheDir(), "plugin.so");
-                          FileOutputStream fos = new FileOutputStream(out);
-                          byte[] buf = new byte[8192]; int n;
-                          while ((n = in.read(buf)) > 0) fos.write(buf, 0, n);
-                          fos.close(); in.close();
-                          pluginPath = out.getAbsolutePath();
-                          Toast.makeText(this, "Плагин загружен!", Toast.LENGTH_SHORT).show();
-                      } catch (Exception e) {
-                          Toast.makeText(this, "Ошибка: " + e.getMessage(), Toast.LENGTH_LONG).show();
-                      }
-                  }
-              }
-
-              private void doInject(String pkg, String localSo) {
+              private void doInject(String pkg) {
                   runOnUiThread(() -> Toast.makeText(this, "Запускаем Oxide...", Toast.LENGTH_SHORT).show());
                   Shell.cmd("monkey -p " + pkg + " 1").exec();
 
@@ -239,16 +253,24 @@ jobs:
                       return;
                   }
 
-                  Shell.cmd("cp " + localSo + " /data/local/tmp/mod.so").exec();
-                  Shell.cmd("chmod 755 /data/local/tmp/mod.so").exec();
+                  // Берем .so файл прямо из нашего APK
+                  File soFile = new File(getApplicationInfo().nativeLibraryDir, "libmodmenu.so");
+                  String path = soFile.getAbsolutePath();
+
+                  // Копируем и даем права (на всякий случай)
+                  Shell.cmd("su -c 'cp " + path + " /data/local/tmp/mod.so'").exec();
+                  Shell.cmd("su -c 'chmod 755 /data/local/tmp/mod.so'").exec();
+                  Shell.cmd("su -c 'chcon u:object_r:system_file:s0 /data/local/tmp/mod.so'").exec();
 
                   boolean ok = injectLibrary(pid, "/data/local/tmp/mod.so");
-                  runOnUiThread(() -> Toast.makeText(this, ok ? "Инжект OK!" : "Инжект провален", Toast.LENGTH_LONG).show());
+                  final int fPid = pid;
+                  runOnUiThread(() -> Toast.makeText(this, ok ? "Чит внедрен! PID: " + fPid : "Ошибка внедрения", Toast.LENGTH_LONG).show());
               }
           }
           EOF
 
-          # 6. Запуск сборки
+          # 9. Запуск сборки
+          cd $PROJECT_DIR
           if [ ! -f "gradlew" ]; then gradle wrapper; fi
           chmod +x gradlew
           ./gradlew assembleDebug
