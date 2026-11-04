@@ -29,7 +29,7 @@ jobs:
 
       - name: Build Everything Automatically
         run: |
-          # 1. Распаковка архива
+          # 1. Распаковка архива с дизайном
           mkdir -p build_dir
           if ls *.zip 1> /dev/null 2>&1; then unzip -o *.zip -d build_dir
           elif ls *.7z 1> /dev/null 2>&1; then sudo apt-get update && sudo apt-get install -y p7zip-full; 7z x *.7z -obuild_dir
@@ -70,46 +70,41 @@ jobs:
           dependencies { implementation 'com.github.topjohnwu.libsu:core:5.2.2' }
           EOF
           
-          # 3. Клонирование ImGui и скачивание готовой libdobby.a
+          # 3. Клонируем ImGuiAndroidVulkanHook и наш проект
           cd app/src/main/cpp
-          git clone --depth 1 https://github.com/ocornut/imgui.git
+          echo "Клонируем ImGuiAndroidVulkanHook..."
+          git clone --depth 1 https://github.com/Kaotic/ImGuiAndroidVulkanHook.git
           
-          echo "Скачиваем готовую libdobby.a..."
-          mkdir -p Dobby/lib/arm64-v8a
-          curl -L -o Dobby/lib/arm64-v8a/libdobby.a https://github.com/3equals3/DobbyHook/raw/main/arm64-v8a/libdobby.a
+          # Копируем Menu и Dobby из репозитория
+          cp -r ImGuiAndroidVulkanHook/Menu/* .
+          cp -r ImGuiAndroidVulkanHook/Dobby .
           
-          mkdir -p Dobby/include
-          curl -L -o Dobby/include/dobby.h https://raw.githubusercontent.com/jmpews/Dobby/master/include/dobby.h
-          
-          # 4. CMakeLists.txt
+          # 4. Создаем CMakeLists.txt (адаптированный под наш инжектор)
           cat << 'EOF' > CMakeLists.txt
           cmake_minimum_required(VERSION 3.22.1)
           project("oxide")
 
-          # Инжектор (Executable)
+          # Наш инжектор
           add_executable(injector_bin injector_bin.cpp)
           target_link_libraries(injector_bin log dl)
           set_target_properties(injector_bin PROPERTIES OUTPUT_NAME "injector_bin.so")
 
-          # Меню (ImGui + Vulkan)
-          add_library(modmenu SHARED modmenu.cpp 
-              imgui/imgui.cpp imgui/imgui_draw.cpp imgui/imgui_tables.cpp imgui/imgui_widgets.cpp
-              imgui/backends/imgui_impl_vulkan.cpp imgui/backends/imgui_impl_android.cpp
-          )
+          # Меню из ImGuiAndroidVulkanHook
+          add_library(modmenu SHARED main.cpp)
+          target_include_directories(modmenu PRIVATE Menu Dobby)
           
-          target_include_directories(modmenu PRIVATE imgui Dobby/include)
-          
-          add_library(dobby STATIC IMPORTED)
-          set_target_properties(dobby PROPERTIES IMPORTED_LOCATION ${CMAKE_CURRENT_SOURCE_DIR}/Dobby/lib/arm64-v8a/libdobby.a)
-          
+          # Подключаем Dobby как статическую библиотеку
+          add_subdirectory(Dobby dobby_build)
+          get_property(DOBBY_INCLUDE_DIRECTORIES TARGET dobby PROPERTY INCLUDE_DIRECTORIES)
+          target_include_directories(modmenu PRIVATE ${DOBBY_INCLUDE_DIRECTORIES})
+
           find_library(log-lib log)
           find_library(android-lib android)
           find_library(vulkan-lib vulkan)
-          
-          target_link_libraries(modmenu ${log-lib} ${android-lib} ${vulkan-lib} dl dobby c++_static)
+          target_link_libraries(modmenu ${log-lib} ${android-lib} ${vulkan-lib} dl dobby)
           EOF
           
-          # 5. injector_bin.cpp
+          # 5. injector_bin.cpp (без изменений, наш инжектор)
           cat << 'EOF' > injector_bin.cpp
           #include <stdio.h>
           #include <stdlib.h>
@@ -188,56 +183,7 @@ jobs:
           }
           EOF
 
-          # 6. modmenu.cpp
-          cat << 'EOF' > modmenu.cpp
-          #include <jni.h>
-          #include <android/log.h>
-          #include <pthread.h>
-          #include <unistd.h>
-          #include <vulkan/vulkan.h>
-          #include <dlfcn.h>
-          #include "imgui/imgui.h"
-          #include "imgui/backends/imgui_impl_vulkan.h"
-          #include "imgui/backends/imgui_impl_android.h"
-          #include "dobby.h"
-
-          #define LOG_TAG "OxideCheat"
-          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
-
-          bool isInit = false;
-          VkResult (*orig_vkQueuePresentKHR)(VkQueue, const VkPresentInfoKHR*) = nullptr;
-
-          VkResult hook_vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo) {
-              if (!isInit) {
-                  isInit = true;
-                  LOGI("vkQueuePresentKHR hooked!");
-                  IMGUI_CHECKVERSION();
-                  ImGui::CreateContext();
-                  ImGui::StyleColorsDark();
-                  ImGui_ImplAndroid_Init(nullptr);
-              }
-              return orig_vkQueuePresentKHR(queue, pPresentInfo);
-          }
-
-          void* menu_thread(void*) {
-              sleep(5); 
-              void* handle = dlopen("libvulkan.so", RTLD_LAZY);
-              if (!handle) { LOGI("libvulkan.so not found"); return nullptr; }
-              void* target = dlsym(handle, "vkQueuePresentKHR");
-              if (!target) { LOGI("vkQueuePresentKHR not found"); return nullptr; }
-              LOGI("Hooking vkQueuePresentKHR...");
-              DobbyHook(target, (void*)hook_vkQueuePresentKHR, (void**)&orig_vkQueuePresentKHR);
-              LOGI("Hook installed!");
-              return nullptr;
-          }
-
-          __attribute__((constructor)) void init() {
-              LOGI("Library loaded!");
-              pthread_t t; pthread_create(&t, nullptr, menu_thread, nullptr);
-          }
-          EOF
-
-          # 7. MainActivity.java (ИСПРАВЛЕНО: убрано System.loadLibrary)
+          # 6. MainActivity.java
           cd "$PROJECT_DIR"
           mkdir -p app/src/main/java/com/example/oxidelauncher
           cat << 'EOF' > app/src/main/java/com/example/oxidelauncher/MainActivity.java
@@ -252,7 +198,6 @@ jobs:
           import com.topjohnwu.superuser.Shell;
 
           public class MainActivity extends Activity {
-
               private final String TARGET_PACKAGE = "com.catsbit.oxidesurvivalisland";
 
               @Override
@@ -312,7 +257,7 @@ jobs:
           }
           EOF
 
-          # 8. Сборка
+          # 7. Сборка
           cd "$PROJECT_DIR"
           if [ ! -f "gradlew" ]; then gradle wrapper; fi
           chmod +x gradlew
