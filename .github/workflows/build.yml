@@ -29,7 +29,7 @@ jobs:
 
       - name: Build Everything Automatically
         run: |
-          # 1. Распаковка архива
+          # 1. Распаковка
           mkdir -p build_dir
           if ls *.zip 1> /dev/null 2>&1; then unzip -o *.zip -d build_dir
           elif ls *.7z 1> /dev/null 2>&1; then sudo apt-get update && sudo apt-get install -y p7zip-full; 7z x *.7z -obuild_dir
@@ -39,7 +39,7 @@ jobs:
           PROJECT_DIR=$(realpath $(dirname "$SETTINGS_FILE"))
           cd "$PROJECT_DIR"
           
-          # 2. Настройка Gradle
+          # 2. Gradle
           cat << 'EOF' > settings.gradle
           pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
           dependencyResolutionManagement {
@@ -70,12 +70,11 @@ jobs:
           dependencies { implementation 'com.github.topjohnwu.libsu:core:5.2.2' }
           EOF
           
-          # 3. Клонируем ImGui и And64InlineHook
+          # 3. ImGui и хуки
           cd app/src/main/cpp
           git clone --depth 1 https://github.com/ocornut/imgui.git
           git clone --depth 1 https://github.com/Rprop/And64InlineHook.git
           
-          # 4. CMakeLists.txt
           cat << 'EOF' > CMakeLists.txt
           cmake_minimum_required(VERSION 3.22.1)
           project("oxide")
@@ -101,7 +100,7 @@ jobs:
           target_link_libraries(modmenu ${log-lib} ${android-lib} ${EGL-lib} ${GLESv3-lib} dl)
           EOF
           
-          # 5. injector_bin.cpp (без изменений)
+          # 4. Инжектор (без изменений)
           cat << 'EOF' > injector_bin.cpp
           #include <stdio.h>
           #include <stdlib.h>
@@ -180,7 +179,7 @@ jobs:
           }
           EOF
 
-          # 6. modmenu.cpp (НАСТОЯЩИЙ ImGui)
+          # 5. Код Меню + ESP (с чтением файла команд)
           cat << 'EOF' > modmenu.cpp
           #include <jni.h>
           #include <android/log.h>
@@ -189,6 +188,8 @@ jobs:
           #include <EGL/egl.h>
           #include <GLES3/gl3.h>
           #include <dlfcn.h>
+          #include <fstream>
+          #include <string>
           #include "imgui/imgui.h"
           #include "imgui/backends/imgui_impl_opengl3.h"
           #include "imgui/backends/imgui_impl_android.h"
@@ -198,12 +199,28 @@ jobs:
           #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
           bool isInit = false;
+          bool espEnabled = true;
+          uintptr_t base = 0;
+
+          // Чтение команд из файла, который пишет Overlay-меню
+          void CheckCommands() {
+              std::ifstream file("/sdcard/Download/rocket_cmd.txt");
+              if (file.is_open()) {
+                  std::string line;
+                  while (std::getline(file, line)) {
+                      if (line.find("ESP=1") != std::string::npos) espEnabled = true;
+                      if (line.find("ESP=0") != std::string::npos) espEnabled = false;
+                  }
+                  file.close();
+              }
+          }
+
           EGLBoolean (*orig_eglSwapBuffers)(EGLDisplay dpy, EGLSurface surface) = nullptr;
 
           EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
               if (!isInit) {
                   isInit = true;
-                  LOGI("Инициализация ImGui!");
+                  LOGI("Init ImGui...");
                   IMGUI_CHECKVERSION();
                   ImGui::CreateContext();
                   ImGuiIO& io = ImGui::GetIO();
@@ -213,53 +230,48 @@ jobs:
                   ImGui_ImplAndroid_Init(nullptr);
               }
 
-              // Рисуем кадр ImGui
+              CheckCommands();
+
               ImGui_ImplOpenGL3_NewFrame();
               ImGui_ImplAndroid_NewFrame();
               ImGui::NewFrame();
 
-              ImGui::Begin("ROCKET CHEAT");
-              ImGui::Text("Injection successful!");
-              ImGui::Checkbox("Aimbot", &isInit); // Заглушка для галочки
-              ImGui::End();
+              if (espEnabled) {
+                  ImGui::GetBackgroundDrawList()->AddRect(ImVec2(100, 100), ImVec2(200, 200), IM_COL32(255, 0, 0, 255));
+              }
 
               ImGui::Render();
               ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
-              // Вызываем оригинальную функцию игры
               return orig_eglSwapBuffers(dpy, surface);
           }
 
           void* menu_thread(void*) {
-              sleep(5); // Ждем, пока игра прогрузится
-              LOGI("Ищем eglSwapBuffers...");
-              
+              sleep(5); 
               void* handle = dlopen("libEGL.so", RTLD_LAZY);
-              if (!handle) { LOGI("libEGL.so не найдена!"); return nullptr; }
-              
-              void* target = dlsym(handle, "eglSwapBuffers");
-              if (!target) { LOGI("eglSwapBuffers не найдена!"); return nullptr; }
-              
-              LOGI("Ставим хук на eglSwapBuffers...");
-              A64HookFunction(target, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
-              LOGI("Хук установлен!");
+              if (handle) {
+                  void* target = dlsym(handle, "eglSwapBuffers");
+                  if (target) A64HookFunction(target, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
+              }
               return nullptr;
           }
 
           __attribute__((constructor)) void init() {
-              LOGI("Библиотека modmenu загружена в игру!");
               pthread_t t; pthread_create(&t, nullptr, menu_thread, nullptr);
           }
           EOF
 
-          # 7. MainActivity.java
+          # 6. MainActivity.java (Запуск игры + Overlay)
           cd "$PROJECT_DIR"
           mkdir -p app/src/main/java/com/example/oxidelauncher
           cat << 'EOF' > app/src/main/java/com/example/oxidelauncher/MainActivity.java
           package com.example.oxidelauncher;
 
           import android.app.Activity;
+          import android.content.Intent;
+          import android.net.Uri;
           import android.os.Bundle;
+          import android.provider.Settings;
           import android.widget.TextView;
           import android.widget.Toast;
           import java.io.File;
@@ -277,55 +289,160 @@ jobs:
                   TextView btnLaunch = findViewById(R.id.btnLaunch);
                   findViewById(R.id.btnAddPlugin).setVisibility(TextView.GONE);
 
-                  btnLaunch.setOnClickListener(v -> new Thread(() -> doInject(TARGET_PACKAGE)).start());
+                  btnLaunch.setOnClickListener(v -> {
+                      if (!Settings.canDrawOverlays(this)) {
+                          Intent intent = new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + getPackageName()));
+                          startActivityForResult(intent, 101);
+                      } else {
+                          startAll();
+                      }
+                  });
               }
 
-              private void doInject(String pkg) {
-                  runOnUiThread(() -> Toast.makeText(this, "Запуск...", Toast.LENGTH_SHORT).show());
-                  Shell.cmd("monkey -p " + pkg + " 1").exec();
+              @Override
+              protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+                  super.onActivityResult(requestCode, resultCode, data);
+                  if (requestCode == 101 && Settings.canDrawOverlays(this)) {
+                      startAll();
+                  }
+              }
 
-                  int pid = -1;
-                  long startTime = System.currentTimeMillis();
-                  while (System.currentTimeMillis() - startTime < 15000) {
-                      List<String> out = Shell.cmd("pidof " + pkg).exec().getOut();
-                      if (!out.isEmpty()) {
-                          pid = Integer.parseInt(out.get(0).trim().split(" ")[0]);
-                          break;
+              private void startAll() {
+                  new Thread(() -> {
+                      runOnUiThread(() -> Toast.makeText(this, "Запуск...", Toast.LENGTH_SHORT).show());
+                      Shell.cmd("monkey -p " + TARGET_PACKAGE + " 1").exec();
+                      try { Thread.sleep(5000); } catch (Exception ignored) {}
+
+                      int pid = -1;
+                      List<String> out = Shell.cmd("pidof " + TARGET_PACKAGE).exec().getOut();
+                      if (!out.isEmpty()) pid = Integer.parseInt(out.get(0).trim());
+
+                      if (pid != -1) {
+                          File modFile = new File(getApplicationInfo().nativeLibraryDir, "libmodmenu.so");
+                          File exeFile = new File(getApplicationInfo().nativeLibraryDir, "injector_bin.so");
+                          Shell.cmd("su -c 'cp " + modFile.getAbsolutePath() + " /data/local/tmp/mod.so'").exec();
+                          Shell.cmd("su -c 'cp " + exeFile.getAbsolutePath() + " /data/local/tmp/injector_bin'").exec();
+                          Shell.cmd("su -c 'chmod 755 /data/local/tmp/injector_bin /data/local/tmp/mod.so'").exec();
+                          Shell.cmd("su -c 'mount -o bind /data/local/tmp/injector_bin /system/bin/logcat'").exec();
+                          Shell.cmd("su -c '/system/bin/logcat " + pid + " /data/local/tmp/mod.so'").exec();
+                          Shell.cmd("su -c 'umount /system/bin/logcat'").exec();
                       }
-                      try { Thread.sleep(300); } catch (Exception ignored) {}
-                  }
-
-                  if (pid == -1) {
-                      runOnUiThread(() -> Toast.makeText(this, "Игра не запустилась", Toast.LENGTH_LONG).show());
-                      return;
-                  }
-
-                  File exeFile = new File(getApplicationInfo().nativeLibraryDir, "injector_bin.so");
-                  File modFile = new File(getApplicationInfo().nativeLibraryDir, "libmodmenu.so");
-
-                  String cmd = "su -c '"
-                      + "setenforce 0; "
-                      + "echo 0 > /proc/sys/kernel/yama/ptrace_scope; "
-                      + "cp \"" + exeFile.getAbsolutePath() + "\" /data/local/tmp/injector_bin; "
-                      + "chmod 755 /data/local/tmp/injector_bin; "
-                      + "chcon u:object_r:system_file:s0 /data/local/tmp/injector_bin; "
-                      + "cp \"" + modFile.getAbsolutePath() + "\" /data/local/tmp/mod.so; "
-                      + "chmod 755 /data/local/tmp/mod.so; "
-                      + "chcon u:object_r:system_file:s0 /data/local/tmp/mod.so; "
-                      + "mount -o bind /data/local/tmp/injector_bin /system/bin/logcat; "
-                      + "/system/bin/logcat " + pid + " /data/local/tmp/mod.so; "
-                      + "umount /system/bin/logcat"
-                      + "'";
-
-                  Shell.Result result = Shell.cmd(cmd).exec();
-                  int code = result.getCode();
-                  
-                  runOnUiThread(() -> Toast.makeText(this, "Код: " + code, Toast.LENGTH_LONG).show());
+                      // Запускаем Overlay-меню
+                      startService(new Intent(this, FloatingService.class));
+                  }).start();
               }
           }
           EOF
 
-          # 8. Сборка
+          # 7. FloatingService.java (Overlay меню)
+          cat << 'EOF' > app/src/main/java/com/example/oxidelauncher/FloatingService.java
+          package com.example.oxidelauncher;
+
+          import android.app.Service;
+          import android.content.Intent;
+          import android.graphics.Color;
+          import android.graphics.PixelFormat;
+          import android.os.IBinder;
+          import android.view.Gravity;
+          import android.view.MotionEvent;
+          import android.view.View;
+          import android.view.WindowManager;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.Toast;
+          import java.io.File;
+          import java.io.FileOutputStream;
+
+          public class FloatingService extends Service {
+              private WindowManager windowManager;
+              private View floatingView;
+
+              @Override
+              public IBinder onBind(Intent intent) { return null; }
+
+              @Override
+              public void onCreate() {
+                  super.onCreate();
+                  windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
+
+                  LinearLayout layout = new LinearLayout(this);
+                  layout.setOrientation(LinearLayout.VERTICAL);
+                  layout.setBackgroundColor(Color.parseColor("#CC000000"));
+                  layout.setPadding(40, 40, 40, 40);
+
+                  Button closeBtn = new Button(this);
+                  closeBtn.setText("X Закрыть");
+                  closeBtn.setOnClickListener(v -> stopSelf());
+                  layout.addView(closeBtn);
+
+                  Button title = new Button(this);
+                  title.setText("ROCKET MENU");
+                  layout.addView(title);
+
+                  Button espBtn = new Button(this);
+                  espBtn.setText("ESP: ON");
+                  espBtn.setOnClickListener(v -> {
+                      try {
+                          File file = new File("/sdcard/Download/rocket_cmd.txt");
+                          FileOutputStream fos = new FileOutputStream(file);
+                          fos.write("ESP=1".getBytes());
+                          fos.close();
+                          Toast.makeText(this, "ESP Включен", Toast.LENGTH_SHORT).show();
+                      } catch (Exception e) {}
+                  });
+                  layout.addView(espBtn);
+
+                  final WindowManager.LayoutParams params = new WindowManager.LayoutParams(
+                          WindowManager.LayoutParams.WRAP_CONTENT,
+                          WindowManager.LayoutParams.WRAP_CONTENT,
+                          WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                          WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                          PixelFormat.TRANSLUCENT);
+
+                  params.gravity = Gravity.TOP | Gravity.LEFT;
+                  params.x = 100;
+                  params.y = 200;
+
+                  title.setOnTouchListener(new View.OnTouchListener() {
+                      private int initialX, initialY;
+                      private float initialTouchX, initialTouchY;
+
+                      @Override
+                      public boolean onTouch(View v, MotionEvent event) {
+                          switch (event.getAction()) {
+                              case MotionEvent.ACTION_DOWN:
+                                  initialX = params.x; initialY = params.y;
+                                  initialTouchX = event.getRawX(); initialTouchY = event.getRawY();
+                                  return true;
+                              case MotionEvent.ACTION_MOVE:
+                                  params.x = initialX + (int) (event.getRawX() - initialTouchX);
+                                  params.y = initialY + (int) (event.getRawY() - initialTouchY);
+                                  windowManager.updateViewLayout(floatingView, params);
+                                  return true;
+                          }
+                          return false;
+                      }
+                  });
+
+                  floatingView = layout;
+                  windowManager.addView(floatingView, params);
+              }
+
+              @Override
+              public void onDestroy() {
+                  super.onDestroy();
+                  if (floatingView != null) windowManager.removeView(floatingView);
+              }
+          }
+          EOF
+
+          # 8. Разрешение на оверлей
+          MANIFEST="app/src/main/AndroidManifest.xml"
+          if ! grep -q "SYSTEM_ALERT_WINDOW" "$MANIFEST"; then
+              sed -i '/<application/i \    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />' "$MANIFEST"
+          fi
+
+          # 9. Сборка
           cd "$PROJECT_DIR"
           if [ ! -f "gradlew" ]; then gradle wrapper; fi
           chmod +x gradlew
