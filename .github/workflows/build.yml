@@ -23,13 +23,14 @@ jobs:
         with:
           packages: 'platform-tools'
 
+      # 1. ИСПРАВЛЕНИЕ: Используем стабильную версию NDK r25b для совместимости с Dobby
       - name: Install NDK and CMake
         run: |
-          sdkmanager "ndk;27.0.12077973" "cmake;3.22.1"
+          sdkmanager "ndk;25.2.9519653" "cmake;3.22.1"
 
       - name: Build Everything Automatically
         run: |
-          # 1. Распаковка архива
+          # 2. Распаковка архива
           mkdir -p build_dir
           if ls *.zip 1> /dev/null 2>&1; then unzip -o *.zip -d build_dir
           elif ls *.7z 1> /dev/null 2>&1; then sudo apt-get update && sudo apt-get install -y p7zip-full; 7z x *.7z -obuild_dir
@@ -39,7 +40,7 @@ jobs:
           PROJECT_DIR=$(realpath $(dirname "$SETTINGS_FILE"))
           cd "$PROJECT_DIR"
           
-          # 2. settings.gradle
+          # 3. Настройка Gradle (указываем версию NDK r25b)
           cat << 'EOF' > settings.gradle
           pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
           dependencyResolutionManagement {
@@ -50,13 +51,12 @@ jobs:
           include ':app'
           EOF
           
-          # 3. app/build.gradle
           cat << 'EOF' > app/build.gradle
           plugins { id 'com.android.application' }
           android {
               namespace 'com.example.oxidelauncher'
               compileSdk 34
-              ndkVersion "27.0.12077973"
+              ndkVersion "25.2.9519653"
               defaultConfig {
                   applicationId "com.example.oxidelauncher"
                   minSdk 24
@@ -71,41 +71,48 @@ jobs:
           dependencies { implementation 'com.github.topjohnwu.libsu:core:5.2.2' }
           EOF
           
-          # 4. Клонируем ImGui и Dobby
+          # 4. Клонирование ImGui и Dobby
           cd app/src/main/cpp
           git clone --depth 1 https://github.com/ocornut/imgui.git
           git clone --depth 1 https://github.com/jmpews/Dobby.git
           
-          # 5. Создаем CMakeLists.txt (с Dobby и Vulkan)
+          # 5. ИСПРАВЛЕНИЕ: Правильный CMakeLists.txt для Dobby
           cat << 'EOF' > CMakeLists.txt
           cmake_minimum_required(VERSION 3.22.1)
           project("oxide")
-          
+
+          # Инжектор (Executable)
           add_executable(injector_bin injector_bin.cpp)
           target_link_libraries(injector_bin log dl)
           set_target_properties(injector_bin PROPERTIES OUTPUT_NAME "injector_bin.so")
-          
+
+          # === НАСТРОЙКА DOBBY (Стандартный подход) ===
+          if(NOT TARGET dobby)
+              set(DOBBY_DIR ${CMAKE_CURRENT_SOURCE_DIR}/Dobby)
+              macro(SET_OPTION option value)
+                  set(${option} ${value} CACHE INTERNAL "" FORCE)
+              endmacro()
+              SET_OPTION(DOBBY_DEBUG OFF)
+              SET_OPTION(DOBBY_GENERATE_SHARED OFF)
+              add_subdirectory(${DOBBY_DIR} dobby)
+              get_property(DOBBY_INCLUDE_DIRECTORIES TARGET dobby PROPERTY INCLUDE_DIRECTORIES)
+              include_directories(. ${DOBBY_INCLUDE_DIRECTORIES} $<TARGET_PROPERTY:dobby,INCLUDE_DIRECTORIES>)
+          endif()
+          # ============================================
+
+          # Меню (ImGui + Vulkan)
           add_library(modmenu SHARED modmenu.cpp 
               imgui/imgui.cpp imgui/imgui_draw.cpp imgui/imgui_tables.cpp imgui/imgui_widgets.cpp
               imgui/backends/imgui_impl_vulkan.cpp imgui/backends/imgui_impl_android.cpp
-              Dobby/source/Backend/UserMode/UserMode.cpp
-              Dobby/source/Backend/UserMode/PlatformUtil/ProcessRuntime.cpp
-              Dobby/source/Backend/UserMode/PlatformUtil/Posix/ProcessRuntime.cpp
-              Dobby/source/Backend/UserMode/PlatformUtil/Posix/MemoryOperation.cpp
-              Dobby/source/Backend/UserMode/PlatformUtil/Posix/ThreadOperation.cpp
-              Dobby/source/Backend/UserMode/PlatformUtil/Posix/FileOperation.cpp
-              Dobby/source/Backend/UserMode/PlatformUtil/Posix/SymbolOperation.cpp
-              Dobby/source/Backend/UserMode/PlatformUtil/Posix/SignalOperation.cpp
-              Dobby/source/Intercept/InlineHook/InlineHook.cpp
-              Dobby/source/Intercept/InlineHook/ARM64/InlineHook.cpp
-              Dobby/source/Trampoline/ARM64/Trampoline.cpp
           )
-          target_include_directories(modmenu PRIVATE imgui Dobby/include)
-          
+          target_include_directories(modmenu PRIVATE imgui)
+
           find_library(log-lib log)
           find_library(android-lib android)
           find_library(vulkan-lib vulkan)
-          target_link_libraries(modmenu ${log-lib} ${android-lib} ${vulkan-lib} dl)
+          
+          # Линкуем с Dobby
+          target_link_libraries(modmenu ${log-lib} ${android-lib} ${vulkan-lib} dl dobby)
           EOF
           
           # 6. Код Инжектора (injector_bin.cpp)
@@ -203,9 +210,6 @@ jobs:
 
           bool isInit = false;
           VkQueue g_Queue = VK_NULL_HANDLE;
-          VkRenderPass g_RenderPass = VK_NULL_HANDLE;
-          VkCommandBuffer g_CommandBuffer = VK_NULL_HANDLE;
-          VkCommandPool g_CommandPool = VK_NULL_HANDLE;
 
           VkResult (*orig_vkQueuePresentKHR)(VkQueue, const VkPresentInfoKHR*) = nullptr;
 
@@ -214,19 +218,16 @@ jobs:
                   isInit = true;
                   g_Queue = queue;
                   LOGI("vkQueuePresentKHR hooked, initializing ImGui...");
-                  // Инициализация ImGui для Vulkan здесь (требует создания render pass и т.д.)
-                  // Это упрощенный пример. В реальном проекте нужно создать все Vulkan ресурсы.
                   IMGUI_CHECKVERSION();
                   ImGui::CreateContext();
                   ImGuiIO& io = ImGui::GetIO();
                   ImGui::StyleColorsDark();
                   ImGui_ImplAndroid_Init(nullptr);
-                  // ImGui_ImplVulkan_Init(...) требует render pass, который мы пока не создаем.
-                  // Для простоты мы пропустим полную инициализацию Vulkan, чтобы просто проверить хук.
-                  // В следующем шаге мы добавим полноценную инициализацию.
+                  // Полная инициализация Vulkan рендерера для ImGui требует создания render pass и других ресурсов.
+                  // В этом примере мы только проверяем, что хук работает.
               }
               
-              // Здесь должен быть код отрисовки ImGui через Vulkan
+              // Пример отрисовки (в реальном проекте требует полной настройки Vulkan)
               // ImGui_ImplVulkan_NewFrame();
               // ImGui_ImplAndroid_NewFrame();
               // ImGui::NewFrame();
@@ -234,7 +235,7 @@ jobs:
               // ImGui::Text("Vulkan Hook Works!");
               // ImGui::End();
               // ImGui::Render();
-              // ... запись команд в command buffer и вызов vkQueueSubmit ...
+              // ... (код записи команд в command buffer и отправки в очередь) ...
 
               return orig_vkQueuePresentKHR(queue, pPresentInfo);
           }
