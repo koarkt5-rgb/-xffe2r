@@ -35,13 +35,11 @@ jobs:
           elif ls *.7z 1> /dev/null 2>&1; then sudo apt-get update && sudo apt-get install -y p7zip-full; 7z x *.7z -obuild_dir
           else cp -r . build_dir/; fi
           
-          # Находим папку и делаем ПУТЬ АБСОЛЮТНЫМ
           SETTINGS_FILE=$(find build_dir -name "settings.gradle" | head -n 1)
           PROJECT_DIR=$(realpath $(dirname "$SETTINGS_FILE"))
-          echo "Папка проекта: $PROJECT_DIR"
           cd "$PROJECT_DIR"
           
-          # 2. Перезаписываем settings.gradle
+          # 2. settings.gradle
           cat << 'EOF' > settings.gradle
           pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
           dependencyResolutionManagement {
@@ -52,7 +50,7 @@ jobs:
           include ':app'
           EOF
           
-          # 3. Перезаписываем app/build.gradle
+          # 3. app/build.gradle
           cat << 'EOF' > app/build.gradle
           plugins { id 'com.android.application' }
           android {
@@ -77,21 +75,21 @@ jobs:
           cd app/src/main/cpp
           git clone --depth 1 https://github.com/ocornut/imgui.git
           
-          # 5. Создаем CMakeLists.txt (ДОБАВЛЕНА СТРОКА target_include_directories)
+          # 5. Создаем CMakeLists.txt
           cat << 'EOF' > CMakeLists.txt
           cmake_minimum_required(VERSION 3.22.1)
           project("oxide")
           
-          # 1. Инжектор
-          add_library(injector SHARED injector.cpp)
-          target_link_libraries(injector log dl)
+          # Инжектор (Executable)
+          add_executable(injector_bin injector_bin.cpp)
+          target_link_libraries(injector_bin log dl)
+          set_target_properties(injector_bin PROPERTIES OUTPUT_NAME "injector_bin.so")
           
-          # 2. Меню (ImGui)
+          # Меню (ImGui)
           add_library(modmenu SHARED modmenu.cpp 
               imgui/imgui.cpp imgui/imgui_draw.cpp imgui/imgui_tables.cpp imgui/imgui_widgets.cpp
               imgui/backends/imgui_impl_opengl3.cpp imgui/backends/imgui_impl_android.cpp
           )
-          # Указываем CMake, где искать imgui.h
           target_include_directories(modmenu PRIVATE imgui)
           
           find_library(log-lib log)
@@ -101,9 +99,8 @@ jobs:
           target_link_libraries(modmenu ${log-lib} ${android-lib} ${EGL-lib} ${GLESv3-lib} dl)
           EOF
           
-          # 6. Код Инжектора (injector.cpp)
-          cat << 'EOF' > injector.cpp
-          #include <jni.h>
+          # 6. Код Инжектора (injector_bin.cpp)
+          cat << 'EOF' > injector_bin.cpp
           #include <stdio.h>
           #include <stdlib.h>
           #include <string.h>
@@ -115,7 +112,11 @@ jobs:
           #include <dlfcn.h>
           #include <linux/elf.h>
           #include <sys/user.h>
-          
+          #include <android/log.h>
+
+          #define LOG_TAG "InjectorBin"
+          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+
           uint64_t get_module_base(pid_t pid, const char* module_name) {
               char filename[64]; snprintf(filename, sizeof(filename), "/proc/%d/maps", pid);
               FILE* fp = fopen(filename, "r"); if (!fp) return 0;
@@ -127,7 +128,7 @@ jobs:
               }
               fclose(fp); return base_addr;
           }
-          
+
           uint64_t remote_call(pid_t pid, uint64_t func_addr, uint64_t* args, int arg_count) {
               struct user_pt_regs regs;
               struct iovec io = { .iov_base = &regs, .iov_len = sizeof(regs) };
@@ -144,27 +145,35 @@ jobs:
               ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &io_saved);
               return ret_val;
           }
-          
-          extern "C" JNIEXPORT jboolean JNICALL
-          Java_com_example_oxidelauncher_MainActivity_injectLibrary(JNIEnv *env, jobject, jint pid, jstring lib_path) {
-              const char* path = env->GetStringUTFChars(lib_path, 0);
-              if (ptrace(PTRACE_ATTACH, pid, 0, 0) == -1) { env->ReleaseStringUTFChars(lib_path, path); return JNI_FALSE; }
+
+          int main(int argc, char** argv) {
+              if (argc < 3) return 1;
+              pid_t pid = atoi(argv[1]);
+              const char* path = argv[2];
+
+              if (ptrace(PTRACE_ATTACH, pid, 0, 0) == -1) return 1;
               int status; waitpid(pid, &status, 0);
+
               uint64_t target_libc_base = get_module_base(pid, "libc.so");
-              if (!target_libc_base) { ptrace(PTRACE_DETACH, pid, 0, 0); env->ReleaseStringUTFChars(lib_path, path); return JNI_FALSE; }
+              if (!target_libc_base) { ptrace(PTRACE_DETACH, pid, 0, 0); return 1; }
+
               void* local_libc = dlopen("libc.so", RTLD_LAZY);
               uint64_t target_mmap = target_libc_base + ((uint64_t)dlsym(local_libc, "mmap") - get_module_base(getpid(), "libc.so"));
               uint64_t target_dlopen = target_libc_base + ((uint64_t)dlsym(local_libc, "dlopen") - get_module_base(getpid(), "libc.so"));
+
               uint64_t mmap_args[] = {0, 256, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, (uint64_t)-1, 0};
               uint64_t remote_mem = remote_call(pid, target_mmap, mmap_args, 6);
+              if (!remote_mem) { ptrace(PTRACE_DETACH, pid, 0, 0); return 1; }
+
               struct iovec local_iov = { .iov_base = (void*)path, .iov_len = strlen(path) + 1 };
               struct iovec remote_iov = { .iov_base = (void*)remote_mem, .iov_len = strlen(path) + 1 };
               process_vm_writev(pid, &local_iov, 1, &remote_iov, 1, 0);
+
               uint64_t dlopen_args[] = {remote_mem, RTLD_NOW};
               uint64_t handle = remote_call(pid, target_dlopen, dlopen_args, 2);
+
               ptrace(PTRACE_DETACH, pid, 0, 0);
-              env->ReleaseStringUTFChars(lib_path, path);
-              return handle != 0 ? JNI_TRUE : JNI_FALSE;
+              return handle != 0 ? 0 : 1;
           }
           EOF
 
@@ -185,11 +194,7 @@ jobs:
           void* menu_thread(void*) {
               sleep(5);
               LOGI("MENU LOADED! ImGui Ready.");
-              while(true) {
-                  if(aimbot) { /* Логика аима */ }
-                  if(esp) { /* Логика есп */ }
-                  sleep(1);
-              }
+              while(true) { sleep(1); }
               return nullptr;
           }
           
@@ -200,25 +205,29 @@ jobs:
           }
           EOF
 
-          # 8. Создаем Java файл (MainActivity.java)
+          # 8. Создаем Java файл (с рабочей кнопкой выбора плагина)
           cd "$PROJECT_DIR"
           mkdir -p app/src/main/java/com/example/oxidelauncher
           cat << 'EOF' > app/src/main/java/com/example/oxidelauncher/MainActivity.java
           package com.example.oxidelauncher;
 
           import android.app.Activity;
+          import android.content.Intent;
+          import android.net.Uri;
           import android.os.Bundle;
           import android.widget.TextView;
           import android.widget.Toast;
           import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.InputStream;
           import java.util.List;
           import com.topjohnwu.superuser.Shell;
 
           public class MainActivity extends Activity {
-              static { System.loadLibrary("injector"); }
-              public native boolean injectLibrary(int pid, String libPath);
 
               private final String TARGET_PACKAGE = "com.catsbit.oxidesurvivalisland";
+              private String customPluginPath = null;
+              private TextView btnAddPlugin;
 
               @Override
               protected void onCreate(Bundle savedInstanceState) {
@@ -226,15 +235,44 @@ jobs:
                   setContentView(R.layout.activity_main);
 
                   TextView btnLaunch = findViewById(R.id.btnLaunch);
-                  findViewById(R.id.btnAddPlugin).setVisibility(TextView.GONE); 
+                  btnAddPlugin = findViewById(R.id.btnAddPlugin); 
 
                   Shell.getShell(shell -> {
                       if (!shell.isRoot()) runOnUiThread(() -> Toast.makeText(this, "НЕТ ROOT!", Toast.LENGTH_LONG).show());
                   });
 
+                  // Кнопка выбора СВОЕГО плагина
+                  btnAddPlugin.setOnClickListener(v -> {
+                      Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                      i.setType("*/*");
+                      startActivityForResult(i, 100);
+                  });
+
+                  // Кнопка запуска
                   btnLaunch.setOnClickListener(v -> {
                       new Thread(() -> doInject(TARGET_PACKAGE)).start();
                   });
+              }
+
+              // Обработка выбора файла из проводника
+              @Override
+              protected void onActivityResult(int req, int res, Intent data) {
+                  super.onActivityResult(req, res, data);
+                  if (req == 100 && res == RESULT_OK && data != null) {
+                      try {
+                          InputStream in = getContentResolver().openInputStream(data.getData());
+                          File out = new File(getCacheDir(), "custom_plugin.so");
+                          FileOutputStream fos = new FileOutputStream(out);
+                          byte[] buf = new byte[8192]; int n;
+                          while ((n = in.read(buf)) > 0) fos.write(buf, 0, n);
+                          fos.close(); in.close();
+                          customPluginPath = out.getAbsolutePath();
+                          btnAddPlugin.setText("Плагин: загружен");
+                          Toast.makeText(this, "Свой плагин выбран!", Toast.LENGTH_SHORT).show();
+                      } catch (Exception e) {
+                          Toast.makeText(this, "Ошибка: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                      }
+                  }
               }
 
               private void doInject(String pkg) {
@@ -257,14 +295,29 @@ jobs:
                       return;
                   }
 
-                  File soFile = new File(getApplicationInfo().nativeLibraryDir, "libmodmenu.so");
-                  String path = soFile.getAbsolutePath();
+                  // Берем бинарник инжектора
+                  File exeFile = new File(getApplicationInfo().nativeLibraryDir, "libinjector_bin.so");
+                  Shell.cmd("su -c 'cp " + exeFile.getAbsolutePath() + " /data/local/tmp/injector_bin'").exec();
+                  Shell.cmd("su -c 'chmod 755 /data/local/tmp/injector_bin'").exec();
 
-                  Shell.cmd("su -c 'cp " + path + " /data/local/tmp/mod.so'").exec();
+                  // Если пользователь выбрал свой плагин — используем его. Если нет — встроенный libmodmenu.so
+                  String finalPluginPath;
+                  if (customPluginPath != null) {
+                      finalPluginPath = customPluginPath;
+                  } else {
+                      File builtInMod = new File(getApplicationInfo().nativeLibraryDir, "libmodmenu.so");
+                      finalPluginPath = builtInMod.getAbsolutePath();
+                  }
+
+                  // Копируем плагин и меняем контекст SELinux
+                  Shell.cmd("su -c 'cp " + finalPluginPath + " /data/local/tmp/mod.so'").exec();
                   Shell.cmd("su -c 'chmod 755 /data/local/tmp/mod.so'").exec();
                   Shell.cmd("su -c 'chcon u:object_r:system_file:s0 /data/local/tmp/mod.so'").exec();
 
-                  boolean ok = injectLibrary(pid, "/data/local/tmp/mod.so");
+                  // Запускаем инжектор от ROOT
+                  Shell.Result result = Shell.cmd("su -c '/data/local/tmp/injector_bin " + pid + " /data/local/tmp/mod.so'").exec();
+                  
+                  boolean ok = (result.getCode() == 0);
                   final int fPid = pid;
                   runOnUiThread(() -> Toast.makeText(this, ok ? "Чит внедрен! PID: " + fPid : "Ошибка внедрения", Toast.LENGTH_LONG).show());
               }
