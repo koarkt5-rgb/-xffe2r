@@ -79,10 +79,14 @@ jobs:
           cp -r ImGuiAndroidVulkanHook/Menu .
           cp -r ImGuiAndroidVulkanHook/Dobby .
           
-          # 4. Создаем CMakeLists.txt (точная копия официального, но с переименованием выхода)
+          # 4. Создаем CMakeLists.txt (ДОБАВЛЕН C++17)
           cat << 'EOF' > CMakeLists.txt
           cmake_minimum_required(VERSION 3.18.1)
           project("OxideLauncher")
+
+          # ЯВНО УКАЗЫВАЕМ СТАНДАРТ C++17
+          set(CMAKE_CXX_STANDARD 17)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
           # --- Наш инжектор (Executable) ---
           add_executable(injector_bin injector_bin.cpp)
