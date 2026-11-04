@@ -31,47 +31,53 @@ jobs:
         run: |
           mkdir -p build_dir
           if ls *.zip 1> /dev/null 2>&1; then
-            echo "Распаковываем ZIP..."
             unzip -o *.zip -d build_dir
           elif ls *.7z 1> /dev/null 2>&1; then
-            echo "Распаковываем 7Z..."
             sudo apt-get update && sudo apt-get install -y p7zip-full
             7z x *.7z -obuild_dir
           else
-            echo "Архивов нет, копируем файлы из корня..."
             cp -r . build_dir/
           fi
 
       - name: Find Gradle Project and Build APK
         run: |
-          # Ищем файл settings.gradle по всем папкам
           SETTINGS_FILE=$(find build_dir -name "settings.gradle" | head -n 1)
-          
-          if [ -z "$SETTINGS_FILE" ]; then
-            echo "ОШИБКА: Файл settings.gradle не найден вообще!"
-            exit 1
-          fi
-          
-          # Получаем путь к папке, где лежит проект (например, build_dir/OxideLauncher)
           PROJECT_DIR=$(dirname "$SETTINGS_FILE")
           echo "Найдена папка с проектом: $PROJECT_DIR"
           
-          # Переходим туда и собираем
           cd "$PROJECT_DIR"
           
-          # Если нет gradlew, создаем его
+          # АВТОИСПРАВЛЕНИЕ: Перезаписываем settings.gradle, чтобы Gradle знал, где искать плагины
+          cat << 'EOF' > settings.gradle
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+                  maven { url 'https://jitpack.io' }
+              }
+          }
+          rootProject.name = "OxideLauncher"
+          include ':app'
+          EOF
+          
           if [ ! -f "gradlew" ]; then
             echo "Генерируем gradlew..."
             gradle wrapper
           fi
           
           chmod +x gradlew
-          # Запускаем сборку
           ./gradlew assembleDebug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: Launcher-APK
-          # Ищем готовый APK во всех вложенных папках
           path: '**/app/build/outputs/apk/debug/app-debug.apk'
